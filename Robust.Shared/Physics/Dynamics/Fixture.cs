@@ -109,6 +109,17 @@ namespace Robust.Shared.Physics.Dynamics
              Other = AccessPermissions.Read)]
         public int CollisionMask;
 
+        /// <summary>
+        /// Whether this fixture's contacts raise StartCollideEvent / EndCollideEvent. A contact raises them if
+        /// EITHER of its two fixtures has this set (box2d v3's per-shape opt-in model). Defaults true so existing
+        /// content is unaffected; set false on a fixture whose collide events have no server-side subscriber
+        /// (e.g. a client-only fly-by sound fixture) to skip the per-contact event raise.
+        /// </summary>
+        [ViewVariables(VVAccess.ReadWrite), DataField("enableContactEvents"),
+         Access(typeof(SharedPhysicsSystem), typeof(FixtureSystem), Friend = AccessPermissions.ReadWriteExecute,
+             Other = AccessPermissions.Read)]
+        public bool EnableContactEvents = true;
+
         void ISerializationHooks.AfterDeserialization()
         {
             // TODO: Temporary until PhysShapeAabb is fixed because some weird shit happens with collisions.
@@ -162,6 +173,7 @@ namespace Robust.Shared.Physics.Dynamics
             fixture.CollisionLayer = CollisionLayer;
             fixture.CollisionMask = CollisionMask;
             fixture.Density = Density;
+            fixture.EnableContactEvents = EnableContactEvents;
         }
 
         /// <summary>
@@ -170,6 +182,7 @@ namespace Robust.Shared.Physics.Dynamics
         public bool Equivalent(Fixture other)
         {
             return Hard == other.Hard &&
+                   EnableContactEvents == other.EnableContactEvents &&
                    CollisionLayer == other.CollisionLayer &&
                    CollisionMask == other.CollisionMask &&
                    Shape.Equals(other.Shape) &&

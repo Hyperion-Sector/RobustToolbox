@@ -353,7 +353,8 @@ public abstract partial class SharedPhysicsSystem
         var bUid = contact.EntityB;
         contact.Flags |= ContactFlags.Deleting;
 
-        if (contact.IsTouching)
+        // Triad: opt-in contact events (see RunContactEvents). Raise the teardown end-collide only if a fixture wants it.
+        if (contact.IsTouching && (fixtureA.EnableContactEvents || fixtureB.EnableContactEvents))
         {
             var ev1 = new EndCollideEvent(aUid, bUid, contact.FixtureAId, contact.FixtureBId, fixtureA, fixtureB, bodyA, bodyB);
             var ev2 = new EndCollideEvent(bUid, aUid, contact.FixtureBId, contact.FixtureAId, fixtureB, fixtureA, bodyB, bodyA);
@@ -597,6 +598,12 @@ public abstract partial class SharedPhysicsSystem
 
                 var fixtureA = contact.FixtureA!;
                 var fixtureB = contact.FixtureB!;
+
+                // Triad: box2d v3 opt-in contact events. A contact raises events if either fixture enables them
+                // (default true, so behavior-preserving until a fixture opts out). Skip when neither wants them.
+                if (!fixtureA.EnableContactEvents && !fixtureB.EnableContactEvents)
+                    return;
+
                 var bodyA = contact.BodyA!;
                 var bodyB = contact.BodyB!;
                 var uidA = contact.EntityA;
@@ -621,6 +628,10 @@ public abstract partial class SharedPhysicsSystem
                 // If something under StartCollideEvent potentially nukes other contacts (e.g. if the entity is deleted)
                 // then we'll just skip the EndCollide.
                 if (fixtureA == null || fixtureB == null) return;
+
+                // Triad: opt-in contact events (see StartTouching).
+                if (!fixtureA.EnableContactEvents && !fixtureB.EnableContactEvents)
+                    return;
 
                 var bodyA = contact.BodyA!;
                 var bodyB = contact.BodyB!;
