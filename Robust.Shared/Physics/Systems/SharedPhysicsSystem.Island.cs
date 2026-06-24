@@ -137,6 +137,12 @@ public abstract partial class SharedPhysicsSystem
     private readonly ObjectPool<List<(Joint Original, Joint Joint)>> _islandJointPool =
         new DefaultObjectPool<List<(Joint Original, Joint Joint)>>(new ListPolicy<(Joint Original, Joint Joint)>(), MaxIslands);
 
+    // Triad: reused across steps to avoid per-tick allocation. Solve runs once per step, sequentially,
+    // so a single reused buffer is safe and keeps the grown backing array instead of re-allocating it.
+    private readonly List<IslandData> _islands = new();
+    private readonly List<(Joint Original, Joint Joint)> _islandJoints = new();
+    private readonly ParallelOptions _solveParallelOptions = new();
+
     internal record struct IslandData(
         int Index,
         bool LoneIsland,
@@ -319,8 +325,10 @@ public abstract partial class SharedPhysicsSystem
             _islandJointPool.Get(),
             new List<(Joint Joint, float Error)>());
 
-        var islands = new List<IslandData>();
-        var islandJoints = new List<(Joint Original, Joint Joint)>();
+        var islands = _islands;
+        islands.Clear();
+        var islandJoints = _islandJoints;
+        islandJoints.Clear();
 
         // Build the relevant islands / graphs for all bodies.
         foreach (var ent in _awakeBodyList)
@@ -662,10 +670,8 @@ public abstract partial class SharedPhysicsSystem
             sleepStatus[i] = false;
         }
 
-        var options = new ParallelOptions()
-        {
-            MaxDegreeOfParallelism = _parallel.ParallelProcessCount,
-        };
+        var options = _solveParallelOptions;
+        options.MaxDegreeOfParallelism = _parallel.ParallelProcessCount;
 
         while (iBegin < actualIslands.Length)
         {
