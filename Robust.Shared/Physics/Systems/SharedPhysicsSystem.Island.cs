@@ -457,7 +457,12 @@ public abstract partial class SharedPhysicsSystem
                                 uidB = jointCompB.Relay.Value;
                             }
 
-                            var copy = joint.Clone(uidA, uidB);
+                            // Only clone when a relay actually remapped an endpoint. Without a remap the clone
+                            // is an identical copy pointing at the same bodies, so we can solve the original
+                            // directly; ReturnIsland skips the no-op CopyTo when original == joint.
+                            var copy = uidA == joint.BodyAUid && uidB == joint.BodyBUid
+                                ? joint
+                                : joint.Clone(uidA, uidB);
                             islandJoints.Add((joint, copy));
                             joint.IslandFlag = true;
                         }
@@ -487,7 +492,10 @@ public abstract partial class SharedPhysicsSystem
                             uidB = jointCompB.Relay.Value;
                         }
 
-                        var copy = joint.Clone(uidA, uidB);
+                        // See the relay-target path above: skip the clone when no endpoint was remapped.
+                        var copy = uidA == joint.BodyAUid && uidB == joint.BodyBUid
+                            ? joint
+                            : joint.Clone(uidA, uidB);
                         islandJoints.Add((joint, copy));
                         joint.IslandFlag = true;
                     }
