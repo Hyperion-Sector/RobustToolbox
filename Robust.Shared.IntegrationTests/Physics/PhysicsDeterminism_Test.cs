@@ -33,6 +33,10 @@ internal sealed class PhysicsDeterminism_Test : RobustIntegrationTest
     // Recorded on fork/master (Federation 277.2.0 + Phase 0 solver-alloc reuse), single-threaded.
     private const ulong GoldenHash = 1043003047946187357UL;
 
+    // Jointed scenario golden (motor-driven revolute bar + loose boxes). Gates the joint solve path,
+    // which the box stack above does not touch. Recorded single-threaded on the same fork/master base.
+    private const ulong JointGoldenHash = 2544177298105339144UL;
+
     [Test]
     public async Task DeterministicStack()
     {
@@ -83,6 +87,73 @@ internal sealed class PhysicsDeterminism_Test : RobustIntegrationTest
         TestContext.WriteLine($"Physics determinism state-hash = {hash}UL");
         Assert.That(hash, Is.EqualTo(GoldenHash),
             "Physics simulation result changed. If intentional, record the printed hash as the new golden.");
+    }
+
+    [Test]
+    public async Task DeterministicJoints()
+    {
+        var server = StartServer(new ServerIntegrationOptions { Pool = false });
+        await server.WaitIdleAsync();
+
+        await server.WaitPost(() => server.CfgMan.SetCVar(CVars.ThreadParallelCount, 1));
+
+        var entMan = server.EntMan;
+        var mapSys = server.System<SharedMapSystem>();
+        var physics = server.System<SharedPhysicsSystem>();
+        var fixtures = server.System<FixtureSystem>();
+        var joints = server.System<SharedJointSystem>();
+
+        await server.WaitPost(() =>
+        {
+            mapSys.CreateMap(out var mapId);
+            physics.SetGravity(new Vector2(0f, -9.8f));
+
+            // Static ground anchor. A body needs a fixture to be valid in the lookup.
+            var groundUid = entMan.Spawn(null, new MapCoordinates(0f, 0f, mapId));
+            var ground = entMan.AddComponent<PhysicsComponent>(groundUid);
+            fixtures.CreateFixture(groundUid, "fix1", new Fixture(new PhysShapeCircle(0.5f), 0, 0, false), body: ground);
+
+            // Motor-driven rotor bar on a revolute joint: spins continuously and flings the loose boxes,
+            // so every tick exercises the joint init/velocity/position solve plus box contacts.
+            var rotorUid = entMan.Spawn(null, new MapCoordinates(0f, 0f, mapId));
+            var rotor = entMan.AddComponent<PhysicsComponent>(rotorUid);
+            physics.SetBodyType(rotorUid, BodyType.Dynamic, body: rotor);
+            physics.SetSleepingAllowed(rotorUid, rotor, false);
+            physics.SetFixedRotation(rotorUid, false, body: rotor);
+            var bar = new PolygonShape();
+            bar.SetAsBox(4f, 0.3f);
+            fixtures.CreateFixture(rotorUid, "fix1", new Fixture(bar, 2, 2, true, 5f), body: rotor);
+            physics.WakeBody(rotorUid, body: rotor);
+
+            var revolute = joints.CreateRevoluteJoint(groundUid, rotorUid);
+            revolute.LocalAnchorA = Vector2.Zero;
+            revolute.LocalAnchorB = Vector2.Zero;
+            revolute.ReferenceAngle = 0f;
+            revolute.MotorSpeed = MathF.PI;
+            revolute.MaxMotorTorque = 1e7f;
+            revolute.EnableMotor = true;
+
+            // Loose boxes for the rotor to scatter (contacts interleaved with the joint solve).
+            var box = new PolygonShape();
+            box.SetAsBox(0.3f, 0.3f);
+            for (var i = 0; i < 8; i++)
+            {
+                var uid = entMan.Spawn(null, new MapCoordinates(-3.5f + i, 3f, mapId));
+                var body = entMan.AddComponent<PhysicsComponent>(uid);
+                physics.SetBodyType(uid, BodyType.Dynamic, body: body);
+                fixtures.CreateFixture(uid, "fix1", new Fixture(box, 2, 2, true, 1f), body: body);
+                physics.WakeBody(uid, body: body);
+            }
+        });
+
+        await server.WaitRunTicks(Ticks);
+
+        var hash = 0UL;
+        await server.WaitPost(() => hash = HashPhysicsState(entMan));
+
+        TestContext.WriteLine($"Physics joint determinism state-hash = {hash}UL");
+        Assert.That(hash, Is.EqualTo(JointGoldenHash),
+            "Jointed physics simulation result changed. If intentional, record the printed hash as the new golden.");
     }
 
     private static ulong HashPhysicsState(IEntityManager entMan)
