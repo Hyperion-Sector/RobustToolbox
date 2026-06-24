@@ -463,9 +463,11 @@ public sealed partial class EntityLookupSystem : EntitySystem
             {
                 var bounds = fixture.Shape.ComputeAABB(broadphaseTransform, i);
                 var proxy = fixture.Proxies[i];
-                tree.MoveProxy(proxy.ProxyId, bounds);
+                // Triad: keep the proxy's tight AABB current (broadphase queries refine on it), but
+                // only churn the tree and queue a re-pair when the body escaped its fattened tree box.
                 proxy.AABB = bounds;
-                moveBuffer.Add(proxy);
+                if (tree.MoveProxy(proxy.ProxyId, bounds))
+                    moveBuffer.Add(proxy);
             }
 
             return;

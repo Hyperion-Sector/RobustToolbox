@@ -168,6 +168,16 @@ namespace Robust.Shared.Physics.Systems
             _contactJob.FrameTime = _frameTime;
             _contactJob.Pairs.Clear();
 
+            // Triad: box2d v3 broadphase finish. EnlargeProxy-on-escape (DynamicTreeBroadPhase.MoveProxy)
+            // grows escaped proxies in place and leaves their subtrees unbalanced; rebuild each dynamic
+            // broadphase tree once here, before the contact-find queries, so traversal hits a balanced
+            // tree. Trees with no escaped proxies this step rebuild in ~O(1) (nothing flagged Enlarged).
+            var bpQuery = AllEntityQuery<BroadphaseComponent>();
+            while (bpQuery.MoveNext(out var broadphase))
+            {
+                broadphase.DynamicTree.Rebuild(false);
+            }
+
             var moveBuffer = _physicsSystem.MoveBuffer;
             var movedGrids = _physicsSystem.MovedGrids;
 

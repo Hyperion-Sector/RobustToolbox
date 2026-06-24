@@ -37,9 +37,24 @@ public sealed class DynamicTreeBroadPhase : IBroadPhase
         return proxyId;
     }
 
-    public void MoveProxy(DynamicTree.Proxy proxy, in Box2 aabb)
+    // Triad: box2d v3 move path, tight-box variant. The node stores the TIGHT box (so every approx
+    // broadphase/lookup query that reads node boxes stays exact, no over-return). If the body did not
+    // move beyond its current node box, skip (also satisfies EnlargeProxy's not-contained contract).
+    // Otherwise enlarge the node in place: cheap O(height) ancestor grow, deferred-rebalanced by the
+    // per-step Rebuild in SharedBroadphaseSystem.FindNewContacts, replacing the old per-move
+    // RemoveLeaf+InsertLeaf. Returns true when the proxy moved and needs re-pairing.
+    // (The box2d fat-box skip that would also cut contact-find needs all approx-true broadphase
+    //  queries flipped to refine on tight; deferred to a follow-on.)
+    public bool MoveProxy(DynamicTree.Proxy proxy, in Box2 aabb)
     {
+        if (_tree.GetFatAabb(proxy) is { } current && current.Contains(aabb))
+            return false;
+
+        // NOTE: EnlargeProxy here (the box2d v3 cheap move) breaks contact-finding even with the
+        // per-step Rebuild, isolated via bisection. RT's EnlargeProxy/Rebuild were dead code (zero
+        // callers) and have a latent bug. Falling back to reinsert (correct) until that is fixed.
         _tree.MoveProxy(proxy, in aabb);
+        return true;
     }
 
     public void RemoveProxy(DynamicTree.Proxy proxy)

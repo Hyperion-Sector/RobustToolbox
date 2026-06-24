@@ -17,7 +17,10 @@ public interface IBroadPhase
 
     DynamicTree.Proxy AddProxy(ref FixtureProxy proxy);
 
-    void MoveProxy(DynamicTree.Proxy proxyId, in Box2 aabb);
+    // Triad: box2d v3 broadphase finish. Returns true if the proxy escaped its fattened tree box
+    // and was enlarged (so it needs re-pairing); false if it stayed inside its fat box (no tree
+    // churn, no re-pair). See DynamicTreeBroadPhase.MoveProxy.
+    bool MoveProxy(DynamicTree.Proxy proxyId, in Box2 aabb);
 
     FixtureProxy? GetProxy(DynamicTree.Proxy proxy);
 
