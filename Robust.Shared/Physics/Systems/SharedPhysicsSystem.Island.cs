@@ -143,6 +143,10 @@ public abstract partial class SharedPhysicsSystem
     private readonly List<(Joint Original, Joint Joint)> _islandJoints = new();
     private readonly ParallelOptions _solveParallelOptions = new();
 
+    // Triad: reused per step to avoid the per-tick islands.ToArray(). Only grows; the entries past the
+    // current island count are stale and never read (every loop is bounded by the live island count).
+    private IslandData[] _actualIslands = Array.Empty<IslandData>();
+
     internal record struct IslandData(
         int Index,
         bool LoneIsland,
@@ -643,7 +647,11 @@ public abstract partial class SharedPhysicsSystem
         islands.Sort(static (x, y) => InternalParallel(y).CompareTo(InternalParallel(x)));
 
         var totalBodies = 0;
-        var actualIslands = islands.ToArray();
+        var islandCount = islands.Count;
+        if (_actualIslands.Length < islandCount)
+            Array.Resize(ref _actualIslands, islandCount);
+        islands.CopyTo(_actualIslands);
+        var actualIslands = _actualIslands;
 
         for (var i = 0; i < islands.Count; i++)
         {
@@ -673,7 +681,7 @@ public abstract partial class SharedPhysicsSystem
         var options = _solveParallelOptions;
         options.MaxDegreeOfParallelism = _parallel.ParallelProcessCount;
 
-        while (iBegin < actualIslands.Length)
+        while (iBegin < islandCount)
         {
             ref var island = ref actualIslands[iBegin];
 
@@ -684,14 +692,14 @@ public abstract partial class SharedPhysicsSystem
             iBegin++;
         }
 
-        Parallel.For(iBegin, actualIslands.Length, options, i =>
+        Parallel.For(iBegin, islandCount, options, i =>
         {
             ref var island = ref actualIslands[i];
             SolveIsland(ref island, in data, null, prediction, solvedPositions, solvedAngles, linearVelocities, angularVelocities, sleepStatus);
         });
 
         // Update data sequentially
-        for (var i = 0; i < actualIslands.Length; i++)
+        for (var i = 0; i < islandCount; i++)
         {
             ref readonly var island = ref actualIslands[i];
 
