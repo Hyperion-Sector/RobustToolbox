@@ -13,7 +13,7 @@ using Robust.UnitTesting.Server;
 
 namespace Robust.Benchmarks.Physics;
 
-[Virtual, MediumRunJob]
+[Virtual, MediumRunJob, MemoryDiagnoser]
 public class PhysicsBenchmark
 {
     // TODO: Rain
