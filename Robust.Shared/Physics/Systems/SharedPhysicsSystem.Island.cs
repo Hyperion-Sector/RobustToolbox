@@ -137,13 +137,18 @@ public abstract partial class SharedPhysicsSystem
     private readonly ObjectPool<List<(Joint Original, Joint Joint)>> _islandJointPool =
         new DefaultObjectPool<List<(Joint Original, Joint Joint)>>(new ListPolicy<(Joint Original, Joint Joint)>(), MaxIslands);
 
-    // Triad: reused across steps to avoid per-tick allocation. Solve runs once per step, sequentially,
+    // The per-island broken-joint list was the one un-pooled list in the island data, allocated
+    // fresh per island per tick. Pool it like the other three; ListPolicy clears it on return.
+    private readonly ObjectPool<List<(Joint Joint, float Error)>> _islandBrokenJointPool =
+        new DefaultObjectPool<List<(Joint Joint, float Error)>>(new ListPolicy<(Joint Joint, float Error)>(), MaxIslands);
+
+    // Reused across steps to avoid per-tick allocation. Solve runs once per step, sequentially,
     // so a single reused buffer is safe and keeps the grown backing array instead of re-allocating it.
     private readonly List<IslandData> _islands = new();
     private readonly List<(Joint Original, Joint Joint)> _islandJoints = new();
     private readonly ParallelOptions _solveParallelOptions = new();
 
-    // Triad: reused per step to avoid the per-tick islands.ToArray(). Only grows; the entries past the
+    // Reused per step to avoid the per-tick islands.ToArray(). Only grows; the entries past the
     // current island count are stale and never read (every loop is bounded by the live island count).
     private IslandData[] _actualIslands = Array.Empty<IslandData>();
 
@@ -327,7 +332,7 @@ public abstract partial class SharedPhysicsSystem
             _islandBodyPool.Get(),
             _islandContactPool.Get(),
             _islandJointPool.Get(),
-            new List<(Joint Joint, float Error)>());
+            _islandBrokenJointPool.Get());
 
         var islands = _islands;
         islands.Clear();
@@ -527,7 +532,7 @@ public abstract partial class SharedPhysicsSystem
             }
             else
             {
-                var data = new IslandData(islandIndex++, false, bodies, contacts, joints, new List<(Joint Joint, float Error)>())
+                var data = new IslandData(islandIndex++, false, bodies, contacts, joints, _islandBrokenJointPool.Get())
                 {
                     MapUid = mapUid.Value
                 };
@@ -594,7 +599,7 @@ public abstract partial class SharedPhysicsSystem
         }
 
         _islandJointPool.Return(island.Joints);
-        island.BrokenJoints.Clear();
+        _islandBrokenJointPool.Return(island.BrokenJoints);
     }
 
     protected virtual void Cleanup(float frameTime)
