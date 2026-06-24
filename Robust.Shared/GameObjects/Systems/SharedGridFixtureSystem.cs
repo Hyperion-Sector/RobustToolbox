@@ -167,7 +167,7 @@ namespace Robust.Shared.GameObjects
                 {
                     var fixture = newFixtures[i].Fixture;
 
-                    // Triad: match grid chunk fixtures by polygon SHAPE only, not a full Fixture.Equals.
+                    // Match grid chunk fixtures by polygon SHAPE only, not a full Fixture.Equals.
                     // The new fixture is always built with the default density, but content (ShuttleSystem,
                     // via GridFixtureChangeEvent) re-applies a non-default density to grid chunk fixtures after
                     // creation. A full Equals therefore always failed on shuttles and destroyed + recreated
