@@ -167,13 +167,18 @@ namespace Robust.Shared.GameObjects
                 {
                     var fixture = newFixtures[i].Fixture;
 
-                    // TODO GRIDS
-                    // Fix this
-                    // This **only** works if we assume the density is always the default (PhysicsConstants.DefaultDensity).
-                    // Hence, this always fails in SS14 because ShuttleSystem.OnGridFixtureChange changes the density.
-                    // So it constantly creats & destroys fixtures unnecessarily
-                    // AAAAA
-                    if (!oldFixture.Equals(fixture))
+                    // Triad: match grid chunk fixtures by polygon SHAPE only, not a full Fixture.Equals.
+                    // The new fixture is always built with the default density, but content (ShuttleSystem,
+                    // via GridFixtureChangeEvent) re-applies a non-default density to grid chunk fixtures after
+                    // creation. A full Equals therefore always failed on shuttles and destroyed + recreated
+                    // every chunk fixture (churning its broadphase proxies) on each tile edit, even when the
+                    // geometry was unchanged. Geometry is the only structural property that changes between
+                    // regenerations (layer/mask/hard are always the grid defaults, and density is re-applied by
+                    // the GridFixtureChangeEvent in RegenerateCollision), so compare the polygon and keep the
+                    // old fixture.
+                    if (oldFixture.Shape is not PolygonShape oldPoly
+                        || fixture.Shape is not PolygonShape newPoly
+                        || !oldPoly.EqualsApprox(newPoly))
                         continue;
 
                     existing = true;
