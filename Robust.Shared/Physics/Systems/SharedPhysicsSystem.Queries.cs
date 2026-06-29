@@ -21,9 +21,10 @@ namespace Robust.Shared.Physics.Systems
      */
     public partial class SharedPhysicsSystem
     {
+        // Needed in all build configs: the server-only contact-event gate in Contacts.cs reads it. Not DEBUG-only.
+        [Dependency] private INetManager _netMan = default!;
 #if DEBUG
         [Dependency] private SharedDebugRayDrawingSystem _sharedDebugRaySystem = default!;
-        [Dependency] private INetManager _netMan = default!;
 #endif
 
         /// <summary>
