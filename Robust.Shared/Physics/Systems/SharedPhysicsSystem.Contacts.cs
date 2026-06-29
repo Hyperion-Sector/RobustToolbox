@@ -353,8 +353,9 @@ public abstract partial class SharedPhysicsSystem
         var bUid = contact.EntityB;
         contact.Flags |= ContactFlags.Deleting;
 
-        // Opt-in contact events (see RunContactEvents). Raise the teardown end-collide only if a fixture wants it.
-        if (contact.IsTouching && (fixtureA.EnableContactEvents || fixtureB.EnableContactEvents))
+        // Opt-in contact events (see RunContactEvents): server-only optimisation. EnableContactEvents is a
+        // server-side, non-networked flag, so the client always raises the teardown end-collide for prediction.
+        if (contact.IsTouching && (!_netMan.IsServer || fixtureA.EnableContactEvents || fixtureB.EnableContactEvents))
         {
             var ev1 = new EndCollideEvent(aUid, bUid, contact.FixtureAId, contact.FixtureBId, fixtureA, fixtureB, bodyA, bodyB);
             var ev2 = new EndCollideEvent(bUid, aUid, contact.FixtureBId, contact.FixtureAId, fixtureB, fixtureA, bodyB, bodyA);
@@ -600,8 +601,9 @@ public abstract partial class SharedPhysicsSystem
                 var fixtureB = contact.FixtureB!;
 
                 // box2d v3 opt-in contact events. A contact raises events if either fixture enables them
-                // (default true, so behavior-preserving until a fixture opts out). Skip when neither wants them.
-                if (!fixtureA.EnableContactEvents && !fixtureB.EnableContactEvents)
+                // (default true, so behavior-preserving until a fixture opts out). Server-only: the flag is not
+                // networked, so the client always raises here, prediction needs the StartCollide events.
+                if (_netMan.IsServer && !fixtureA.EnableContactEvents && !fixtureB.EnableContactEvents)
                     return;
 
                 var bodyA = contact.BodyA!;
@@ -629,8 +631,8 @@ public abstract partial class SharedPhysicsSystem
                 // then we'll just skip the EndCollide.
                 if (fixtureA == null || fixtureB == null) return;
 
-                // Opt-in contact events (see StartTouching).
-                if (!fixtureA.EnableContactEvents && !fixtureB.EnableContactEvents)
+                // Opt-in contact events (see StartTouching): server-only suppression, client always raises.
+                if (_netMan.IsServer && !fixtureA.EnableContactEvents && !fixtureB.EnableContactEvents)
                     return;
 
                 var bodyA = contact.BodyA!;
