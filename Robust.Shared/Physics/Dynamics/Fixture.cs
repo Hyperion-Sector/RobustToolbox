@@ -115,7 +115,14 @@ namespace Robust.Shared.Physics.Dynamics
         /// content is unaffected; set false on a fixture whose collide events have no server-side subscriber
         /// (e.g. a client-only fly-by sound fixture) to skip the per-contact event raise.
         /// </summary>
-        [ViewVariables(VVAccess.ReadWrite), DataField("enableContactEvents"),
+        /// <remarks>
+        /// <see cref="NonSerializedAttribute"/> deliberately keeps this OFF the network wire. It is a server-side
+        /// gate (the client never needs the value), and Fixture is <see cref="NetSerializableAttribute"/>, so
+        /// adding a networked field here would change Fixture's serializer hash and break deserialization for any
+        /// client running a stock RobustToolbox engine off the official launcher. Both sides load it from the
+        /// prototype via DataField; runtime-created fixtures default true on the client.
+        /// </remarks>
+        [ViewVariables(VVAccess.ReadWrite), DataField("enableContactEvents"), NonSerialized,
          Access(typeof(SharedPhysicsSystem), typeof(FixtureSystem), Friend = AccessPermissions.ReadWriteExecute,
              Other = AccessPermissions.Read)]
         public bool EnableContactEvents = true;
