@@ -37,6 +37,11 @@ internal sealed class PhysicsDeterminism_Test : RobustIntegrationTest
     // which the box stack above does not touch. Recorded single-threaded on the same fork/master base.
     private const ulong JointGoldenHash = 2544177298105339144UL;
 
+    // Broadphase scenario golden (closed box of mutually-colliding movers). Sensitive to broadphase
+    // pair-finding order/AABB, which the stack + joint goldens do not exercise. Gates Phase-4 broadphase
+    // changes for behavior-preservation. Recorded single-threaded on the same fork/master base.
+    private const ulong BroadphaseGoldenHash = 13415639544356533818UL;
+
     [Test]
     public async Task DeterministicStack()
     {
@@ -154,6 +159,69 @@ internal sealed class PhysicsDeterminism_Test : RobustIntegrationTest
         TestContext.WriteLine($"Physics joint determinism state-hash = {hash}UL");
         Assert.That(hash, Is.EqualTo(JointGoldenHash),
             "Jointed physics simulation result changed. If intentional, record the printed hash as the new golden.");
+    }
+
+    [Test]
+    public async Task DeterministicBroadphase()
+    {
+        var server = StartServer(new ServerIntegrationOptions { Pool = false });
+        await server.WaitIdleAsync();
+
+        await server.WaitPost(() => server.CfgMan.SetCVar(CVars.ThreadParallelCount, 1));
+
+        var entMan = server.EntMan;
+        var mapSys = server.System<SharedMapSystem>();
+        var physics = server.System<SharedPhysicsSystem>();
+        var fixtures = server.System<FixtureSystem>();
+
+        await server.WaitPost(() =>
+        {
+            mapSys.CreateMap(out var mapId);
+            physics.SetGravity(Vector2.Zero); // motion comes from initial velocity, not gravity
+
+            // Closed box of static walls so the movers stay dense and keep colliding (broadphase churn
+            // with real pairs whose resolution order depends on pair-finding).
+            var wall = entMan.Spawn(null, new MapCoordinates(0f, 0f, mapId));
+            var wallBody = entMan.AddComponent<PhysicsComponent>(wall);
+            foreach (var (a, b) in new[]
+                     {
+                         (new Vector2(-10f, -10f), new Vector2(10f, -10f)),
+                         (new Vector2(10f, -10f), new Vector2(10f, 10f)),
+                         (new Vector2(10f, 10f), new Vector2(-10f, 10f)),
+                         (new Vector2(-10f, 10f), new Vector2(-10f, -10f)),
+                     })
+            {
+                fixtures.CreateFixture(wall, $"w{a.X}{a.Y}", new Fixture(new EdgeShape(a, b), 2, 2, true), body: wallBody);
+            }
+            physics.WakeBody(wall, body: wallBody);
+
+            // Mutually-colliding dynamic boxes with fixed-seed random velocities.
+            var box = new PolygonShape();
+            box.SetAsBox(0.3f, 0.3f);
+            var rng = new Random(20260630);
+            for (var i = 0; i < 60; i++)
+            {
+                var pos = new Vector2((float) (rng.NextDouble() * 16 - 8), (float) (rng.NextDouble() * 16 - 8));
+                var uid = entMan.Spawn(null, new MapCoordinates(pos, mapId));
+                var body = entMan.AddComponent<PhysicsComponent>(uid);
+                physics.SetBodyType(uid, BodyType.Dynamic, body: body);
+                fixtures.CreateFixture(uid, "fix1", new Fixture(box, 2, 2, true, 1f), body: body);
+                var vel = new Vector2((float) (rng.NextDouble() * 2 - 1), (float) (rng.NextDouble() * 2 - 1));
+                if (vel != Vector2.Zero)
+                    vel = Vector2.Normalize(vel) * 8f;
+                physics.SetLinearVelocity(uid, vel, body: body);
+                physics.WakeBody(uid, body: body);
+            }
+        });
+
+        await server.WaitRunTicks(Ticks);
+
+        var hash = 0UL;
+        await server.WaitPost(() => hash = HashPhysicsState(entMan));
+
+        TestContext.WriteLine($"Physics broadphase determinism state-hash = {hash}UL");
+        Assert.That(hash, Is.EqualTo(BroadphaseGoldenHash),
+            "Broadphase physics simulation result changed. If intentional, record the printed hash as the new golden.");
     }
 
     private static ulong HashPhysicsState(IEntityManager entMan)
