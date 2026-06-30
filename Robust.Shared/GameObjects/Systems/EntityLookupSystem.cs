@@ -463,7 +463,9 @@ public sealed partial class EntityLookupSystem : EntitySystem
             {
                 var bounds = fixture.Shape.ComputeAABB(broadphaseTransform, i);
                 var proxy = fixture.Proxies[i];
+                var churnStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 tree.MoveProxy(proxy.ProxyId, bounds);
+                _physics.PhaseProfiler.AddTicks(PhysicsPhase.MoveChurn, System.Diagnostics.Stopwatch.GetTimestamp() - churnStart);
                 proxy.AABB = bounds;
                 moveBuffer.Add(proxy);
             }

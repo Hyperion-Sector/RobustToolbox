@@ -48,7 +48,7 @@ namespace Robust.Shared.Physics.Systems
                 Buckets = Histogram.ExponentialBuckets(0.000_001, 1.5, 25),
             });
 
-        protected readonly PhysicsPhaseProfiler PhaseProfiler = new();
+        public PhysicsPhaseProfiler PhaseProfiler { get; } = new();
 
         [Dependency] private IConfigurationManager _cfg = default!;
         [Dependency] private IManifoldManager _manifoldManager = default!;
