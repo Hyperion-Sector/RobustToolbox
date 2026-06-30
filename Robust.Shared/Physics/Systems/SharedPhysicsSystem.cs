@@ -276,16 +276,23 @@ namespace Robust.Shared.Physics.Systems
             var frameTime = deltaTime / _substeps;
 
             EffectiveCurTime = _gameTiming.CurTime;
+            PhaseProfiler.BeginTick();
             for (int i = 0; i < _substeps; i++)
             {
-                var updateBeforeSolve = new PhysicsUpdateBeforeSolveEvent(prediction, frameTime);
-                RaiseLocalEvent(ref updateBeforeSolve);
+                using (PhaseProfiler.Measure(PhysicsPhase.Prestep))
+                {
+                    var updateBeforeSolve = new PhysicsUpdateBeforeSolveEvent(prediction, frameTime);
+                    RaiseLocalEvent(ref updateBeforeSolve);
+                }
 
                 // Find new contacts and (TODO: temporary) update any per-map virtual controllers
 
                 // Box2D does this at the end of a step and also here when there's a fixture update.
                 // Given external stuff can move bodies we'll just do this here.
-                _broadphase.FindNewContacts();
+                using (PhaseProfiler.Measure(PhysicsPhase.ContactFind))
+                {
+                    _broadphase.FindNewContacts();
+                }
 
                 // TODO PHYSICS Fix Collision Mispredicts
                 // If a physics update induces a position update that brings fixtures into contact, the collision starts in the NEXT tick,
@@ -309,7 +316,10 @@ namespace Robust.Shared.Physics.Systems
                 // of to fix this would be to always call `CollideContacts` again at the very end of a physics update.
                 // But that might be unnecessarily expensive for what are hopefully only infrequent mispredicts.
 
-                CollideContacts();
+                using (PhaseProfiler.Measure(PhysicsPhase.Narrowphase))
+                {
+                    CollideContacts();
+                }
 
                 Step(frameTime, prediction);
 
@@ -325,6 +335,8 @@ namespace Robust.Shared.Physics.Systems
                 EffectiveCurTime = EffectiveCurTime.Value + TimeSpan.FromSeconds(frameTime);
             }
 
+            PhaseProfiler.EndTick();
+            ObservePhaseProfile();
             EffectiveCurTime = null;
         }
 
