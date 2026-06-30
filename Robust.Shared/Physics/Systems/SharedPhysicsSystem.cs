@@ -39,6 +39,17 @@ namespace Robust.Shared.Physics.Systems
                 Buckets = Histogram.ExponentialBuckets(0.000_001, 1.5, 25)
             });
 
+        internal static readonly Histogram PhysicsPhaseHistogram = Metrics.CreateHistogram(
+            "robust_physics_phase_seconds",
+            "Per-phase physics step time, the decomposition spine (see physics test suite).",
+            new HistogramConfiguration
+            {
+                LabelNames = new[] { "phase" },
+                Buckets = Histogram.ExponentialBuckets(0.000_001, 1.5, 25),
+            });
+
+        protected readonly PhysicsPhaseProfiler PhaseProfiler = new();
+
         [Dependency] private IConfigurationManager _cfg = default!;
         [Dependency] private IManifoldManager _manifoldManager = default!;
         [Dependency] private IParallelManager _parallel = default!;
@@ -315,6 +326,17 @@ namespace Robust.Shared.Physics.Systems
             }
 
             EffectiveCurTime = null;
+        }
+
+        private void ObservePhaseProfile()
+        {
+            var seconds = PhaseProfiler.LastTickSeconds;
+            for (var i = 0; i < seconds.Count; i++)
+            {
+                PhysicsPhaseHistogram
+                    .WithLabels(((PhysicsPhase) i).ToString())
+                    .Observe(seconds[i]);
+            }
         }
 
         protected virtual void FinalStep()
