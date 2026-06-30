@@ -1,4 +1,3 @@
-// RobustToolbox/Robust.Shared.IntegrationTests/Physics/PhysicsPhaseProfiler_Test.cs
 using System.Threading.Tasks;
 using NUnit.Framework;
 using Robust.Shared.Physics;

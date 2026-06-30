@@ -8,6 +8,11 @@ namespace Robust.Shared.Physics;
 /// <summary>
 /// Buckets the physics step into the cost paths an optimization would target. See the physics test suite
 /// design: buckets are defined by target, not call order, so each candidate maps to exactly one.
+///
+/// WIRED (populated today): Prestep, ContactFind, Narrowphase, ConstraintSolve, MoveChurn.
+/// RESERVED (declared for the taxonomy but not yet timed — they report 0 until a later plan wires their
+/// seam; a 0 series means "not measured yet", NOT "free"): GridQuery, IslandBuild, ConstraintPrep,
+/// Integrate, WriteBack.
 /// </summary>
 public enum PhysicsPhase
 {
@@ -29,7 +34,7 @@ public enum PhysicsPhase
 /// </summary>
 public sealed class PhysicsPhaseProfiler
 {
-    private const int Count = (int) PhysicsPhase.WriteBack + 1;
+    private static readonly int Count = Enum.GetValues<PhysicsPhase>().Length;
 
     private readonly long[] _ticks = new long[Count];
     private readonly double[] _lastSeconds = new double[Count];

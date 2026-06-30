@@ -843,6 +843,8 @@ public abstract partial class SharedPhysicsSystem
         }
 
         // Velocity solver
+        // Hyperion: ConstraintSolve bucket = the velocity + position constraint iterations only
+        // (the prep/warm-start and the integrate step between them are not counted here).
         var solveStart = Stopwatch.GetTimestamp();
         for (var i = 0; i < data.VelocityIterations; i++)
         {
