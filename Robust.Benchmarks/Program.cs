@@ -13,6 +13,11 @@ namespace Robust.Benchmarks
         // --anyCategories=ctg1,ctg2
         public static void Main(string[] args)
         {
+            if (args.Length > 0 && args[0] == "--bucket-report")
+            {
+                Robust.Benchmarks.Physics.PhysicsBucketReport.Run(args);
+                return;
+            }
 #if DEBUG
             Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine("\nWARNING: YOU ARE RUNNING A DEBUG BUILD, USE A RELEASE BUILD FOR AN ACCURATE BENCHMARK");
