@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Numerics;
 using System.Threading.Tasks;
 using Microsoft.Extensions.ObjectPool;
@@ -842,6 +843,7 @@ public abstract partial class SharedPhysicsSystem
         }
 
         // Velocity solver
+        var solveStart = Stopwatch.GetTimestamp();
         for (var i = 0; i < data.VelocityIterations; i++)
         {
             for (var j = 0; j < jointCount; ++j)
@@ -861,6 +863,7 @@ public abstract partial class SharedPhysicsSystem
 
             SolveVelocityConstraints(in island, options, velocityConstraints, linearVelocities, angularVelocities);
         }
+        PhaseProfiler.AddTicks(PhysicsPhase.ConstraintSolve, Stopwatch.GetTimestamp() - solveStart);
 
         // Store for warm starting.
         StoreImpulses(in island, velocityConstraints);
@@ -896,6 +899,7 @@ public abstract partial class SharedPhysicsSystem
 
         island.PositionSolved = false;
 
+        var posStart = Stopwatch.GetTimestamp();
         for (var i = 0; i < data.PositionIterations; i++)
         {
             var contactsOkay = SolvePositionConstraints(in data, in island, options, positionConstraints, positions, angles);
@@ -919,6 +923,7 @@ public abstract partial class SharedPhysicsSystem
                 break;
             }
         }
+        PhaseProfiler.AddTicks(PhysicsPhase.ConstraintSolve, Stopwatch.GetTimestamp() - posStart);
 
         // Transform the solved positions back into local terms
         // This means we can run the entire solver in parallel and not have to worry about stale world positions later
