@@ -28,6 +28,9 @@ public static class PhysicsScenarios
     /// <summary>10 simulated seconds at <see cref="FrameTime"/>.</summary>
     public const int DefaultTicks = 625;
 
+    /// <summary>Settling window for <see cref="BuildBigPyramid"/> — long enough to exercise the big-island solve.</summary>
+    public const int BigPyramidTicks = 200;
+
     /// <summary>Steps an already-built simulation <paramref name="ticks"/> times.</summary>
     public static void Step(ISimulation sim, int ticks)
     {
@@ -43,7 +46,53 @@ public static class PhysicsScenarios
         new PhysicsScenario("Tumbler", BuildTumbler, DefaultTicks),
         new PhysicsScenario("Scatter", BuildScatter, DefaultTicks),
         new PhysicsScenario("MultiMap", BuildMultiMap, DefaultTicks),
+        new PhysicsScenario("BigPyramid", BuildBigPyramid, BigPyramidTicks),
     };
+
+    /// <summary>
+    /// One large settling pyramid (1275 boxes) on a wide ground edge — a SINGLE big contact island
+    /// (&gt; 128 bodies, so the solver runs it internally-parallel). Sleeping is disabled so the island is
+    /// solved every tick, giving a sustained constraint-solve load. This is the isolation load for the
+    /// graph-color solver candidate (B); the existing Smash load is broadphase-bound, not solver-bound.
+    /// </summary>
+    public static void BuildBigPyramid(ISimulation sim)
+    {
+        var entManager = sim.Resolve<IEntityManager>();
+        entManager.System<SharedMapSystem>().CreateMap(out var mapId);
+
+        var physics = entManager.System<SharedPhysicsSystem>();
+        var fixtures = entManager.System<FixtureSystem>();
+        physics.SetGravity(new Vector2(0f, -9.8f));
+
+        const int baseCount = 50; // 50+49+...+1 = 1275 boxes => one island > 128 bodies (trips InternalParallel)
+        const float extent = 0.5f;
+
+        // Wide static ground under the whole base.
+        var groundUid = entManager.SpawnEntity(null, new MapCoordinates(0, 0, mapId));
+        var ground = entManager.AddComponent<PhysicsComponent>(groundUid);
+        var edge = new EdgeShape(new Vector2(-2f * extent * baseCount, 0f), new Vector2(2f * extent * baseCount, 0f));
+        fixtures.CreateFixture(groundUid, "fix1", new Fixture(edge, 2, 2, true), body: ground);
+        physics.WakeBody(groundUid, body: ground);
+
+        var shape = new PolygonShape();
+        shape.SetAsBox(extent, extent);
+
+        for (var i = 0; i < baseCount; i++)
+        {
+            var y = (2f * i + 1f) * extent;
+            for (var j = i; j < baseCount; j++)
+            {
+                var x = (i + 1f) * extent + 2f * (j - i) * extent - 0.5f * baseCount;
+                var boxUid = entManager.SpawnEntity(null, new MapCoordinates(new Vector2(x, y), mapId));
+                var box = entManager.AddComponent<PhysicsComponent>(boxUid);
+                physics.SetBodyType(boxUid, BodyType.Dynamic, body: box);
+                fixtures.CreateFixture(boxUid, "fix1", new Fixture(shape, 2, 2, true, 5f), body: box);
+                physics.WakeBody(boxUid, body: box);
+                // Keep the island awake so the solver runs it every tick => sustained, measurable solver load.
+                physics.SetSleepingAllowed(boxUid, box, false);
+            }
+        }
+    }
 
     private static void ScatterOnMap(IEntityManager entManager, MapId mapId, int count, int seed)
     {
