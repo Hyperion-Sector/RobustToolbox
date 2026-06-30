@@ -41,7 +41,55 @@ public static class PhysicsScenarios
         new PhysicsScenario("Smash", BuildSmash, DefaultTicks),
         new PhysicsScenario("ManyPyramids", BuildManyPyramids, DefaultTicks),
         new PhysicsScenario("Tumbler", BuildTumbler, DefaultTicks),
+        new PhysicsScenario("Scatter", BuildScatter, DefaultTicks),
+        new PhysicsScenario("MultiMap", BuildMultiMap, DefaultTicks),
     };
+
+    private static void ScatterOnMap(IEntityManager entManager, MapId mapId, int count, int seed)
+    {
+        var physics = entManager.System<SharedPhysicsSystem>();
+        var fixtures = entManager.System<FixtureSystem>();
+        physics.SetGravity(Vector2.Zero);
+
+        var shape = new PolygonShape();
+        shape.SetAsBox(0.25f, 0.25f);
+        var rng = new Random(seed);
+
+        for (var i = 0; i < count; i++)
+        {
+            var pos = new Vector2((float) (rng.NextDouble() * 120 - 60), (float) (rng.NextDouble() * 120 - 60));
+            var uid = entManager.SpawnEntity(null, new MapCoordinates(pos, mapId));
+            var body = entManager.AddComponent<PhysicsComponent>(uid);
+            physics.SetBodyType(uid, BodyType.Dynamic, body: body);
+            physics.SetSleepingAllowed(uid, body, false);
+            // layer 1 / mask 0 => non-colliding: sustained MoveChurn + ContactFind, no narrowphase/solver.
+            fixtures.CreateFixture(uid, "fix1", new Fixture(shape, 1, 0, true, 1f), body: body);
+            var vel = new Vector2((float) (rng.NextDouble() * 2 - 1), (float) (rng.NextDouble() * 2 - 1));
+            if (vel != Vector2.Zero)
+                vel = Vector2.Normalize(vel) * 12f;
+            physics.SetLinearVelocity(uid, vel);
+            physics.WakeBody(uid, body: body);
+        }
+    }
+
+    public static void BuildScatter(ISimulation sim)
+    {
+        var entManager = sim.Resolve<IEntityManager>();
+        entManager.System<SharedMapSystem>().CreateMap(out var mapId);
+        ScatterOnMap(entManager, mapId, count: 2000, seed: 1234);
+    }
+
+    public static void BuildMultiMap(ISimulation sim)
+    {
+        var entManager = sim.Resolve<IEntityManager>();
+        const int maps = 16;
+        const int perMap = 150;
+        for (var m = 0; m < maps; m++)
+        {
+            entManager.System<SharedMapSystem>().CreateMap(out var mapId);
+            ScatterOnMap(entManager, mapId, count: perMap, seed: 1000 + m);
+        }
+    }
 
     public static void BuildSmash(ISimulation sim)
     {

@@ -60,4 +60,36 @@ public class PhysicsBenchmark
     public void Tumbler() => PhysicsScenarios.Step(_tumblerSim, PhysicsScenarios.DefaultTicks);
 
     #endregion
+
+    #region Scatter
+
+    private ISimulation _scatterSim = default!;
+
+    [GlobalSetup(Target = nameof(Scatter))]
+    public void ScatterSetup()
+    {
+        _scatterSim = RobustServerSimulation.NewSimulation().InitializeInstance();
+        PhysicsScenarios.BuildScatter(_scatterSim);
+    }
+
+    [Benchmark]
+    public void Scatter() => PhysicsScenarios.Step(_scatterSim, PhysicsScenarios.DefaultTicks);
+
+    #endregion
+
+    #region MultiMap
+
+    private ISimulation _multiMapSim = default!;
+
+    [GlobalSetup(Target = nameof(MultiMap))]
+    public void MultiMapSetup()
+    {
+        _multiMapSim = RobustServerSimulation.NewSimulation().InitializeInstance();
+        PhysicsScenarios.BuildMultiMap(_multiMapSim);
+    }
+
+    [Benchmark]
+    public void MultiMap() => PhysicsScenarios.Step(_multiMapSim, PhysicsScenarios.DefaultTicks);
+
+    #endregion
 }

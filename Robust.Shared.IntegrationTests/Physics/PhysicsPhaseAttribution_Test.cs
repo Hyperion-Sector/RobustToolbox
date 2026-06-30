@@ -58,4 +58,91 @@ public sealed class PhysicsPhaseAttribution_Test
         Assert.That(maxChurn, Is.GreaterThan(0), "move-churn should register while boxes move");
         Assert.That(maxNarrow, Is.GreaterThan(0), "narrowphase should register with active contacts");
     }
+
+    [Test]
+    public void ScatterFieldPopulatesMoveChurnAndContactFind()
+    {
+        var sim = RobustServerSimulation.NewSimulation().InitializeInstance();
+        var entMan = sim.Resolve<IEntityManager>();
+        var physics = entMan.System<SharedPhysicsSystem>();
+        var fixtures = entMan.System<FixtureSystem>();
+        entMan.System<SharedMapSystem>().CreateMap(out var mapId);
+        physics.SetGravity(Vector2.Zero);
+
+        // Non-colliding (layer 1 / mask 0) movers: proxies reinsert every tick (MoveChurn) and the
+        // broadphase queries per moved proxy (ContactFind), but nothing blocks => solver stays idle.
+        var box = new PolygonShape();
+        box.SetAsBox(0.25f, 0.25f);
+        var rng = new System.Random(1234);
+        for (var i = 0; i < 400; i++)
+        {
+            var pos = new Vector2((float) (rng.NextDouble() * 40 - 20), (float) (rng.NextDouble() * 40 - 20));
+            var uid = entMan.SpawnEntity(null, new MapCoordinates(pos, mapId));
+            var body = entMan.AddComponent<PhysicsComponent>(uid);
+            physics.SetBodyType(uid, BodyType.Dynamic, body: body);
+            physics.SetSleepingAllowed(uid, body, false);
+            fixtures.CreateFixture(uid, "fix1", new Fixture(box, 1, 0, true, 1f), body: body);
+            var vel = new Vector2((float) (rng.NextDouble() * 2 - 1), (float) (rng.NextDouble() * 2 - 1));
+            if (vel != Vector2.Zero)
+                vel = Vector2.Normalize(vel) * 12f;
+            physics.SetLinearVelocity(uid, vel);
+            physics.WakeBody(uid, body: body);
+        }
+
+        double maxChurn = 0, maxContact = 0, maxSolve = 0;
+        for (var t = 0; t < 60; t++)
+        {
+            entMan.TickUpdate(1f / 60f, false);
+            var s = physics.PhaseProfiler.LastTickSeconds;
+            maxChurn = Math.Max(maxChurn, s[(int) PhysicsPhase.MoveChurn]);
+            maxContact = Math.Max(maxContact, s[(int) PhysicsPhase.ContactFind]);
+            maxSolve = Math.Max(maxSolve, s[(int) PhysicsPhase.ConstraintSolve]);
+        }
+
+        Assert.That(maxChurn, Is.GreaterThan(0), "move-churn should register every tick for a mover field");
+        Assert.That(maxContact, Is.GreaterThan(0), "contact-find tree queries should register for moving proxies");
+        Assert.That(maxChurn, Is.GreaterThan(maxSolve),
+            "a non-colliding mover field must be move-churn dominant, not solver dominant");
+    }
+
+    [Test]
+    public void MultiMapFieldDistributesMoveChurn()
+    {
+        var sim = RobustServerSimulation.NewSimulation().InitializeInstance();
+        var entMan = sim.Resolve<IEntityManager>();
+        var physics = entMan.System<SharedPhysicsSystem>();
+        var fixtures = entMan.System<FixtureSystem>();
+
+        var box = new PolygonShape();
+        box.SetAsBox(0.25f, 0.25f);
+        for (var m = 0; m < 4; m++)
+        {
+            entMan.System<SharedMapSystem>().CreateMap(out var mapId);
+            physics.SetGravity(Vector2.Zero);
+            var rng = new System.Random(1000 + m);
+            for (var i = 0; i < 100; i++)
+            {
+                var pos = new Vector2((float) (rng.NextDouble() * 40 - 20), (float) (rng.NextDouble() * 40 - 20));
+                var uid = entMan.SpawnEntity(null, new MapCoordinates(pos, mapId));
+                var body = entMan.AddComponent<PhysicsComponent>(uid);
+                physics.SetBodyType(uid, BodyType.Dynamic, body: body);
+                physics.SetSleepingAllowed(uid, body, false);
+                fixtures.CreateFixture(uid, "fix1", new Fixture(box, 1, 0, true, 1f), body: body);
+                var vel = new Vector2((float) (rng.NextDouble() * 2 - 1), (float) (rng.NextDouble() * 2 - 1));
+                if (vel != Vector2.Zero)
+                    vel = Vector2.Normalize(vel) * 12f;
+                physics.SetLinearVelocity(uid, vel);
+                physics.WakeBody(uid, body: body);
+            }
+        }
+
+        double maxChurn = 0;
+        for (var t = 0; t < 60; t++)
+        {
+            entMan.TickUpdate(1f / 60f, false);
+            maxChurn = Math.Max(maxChurn, physics.PhaseProfiler.LastTickSeconds[(int) PhysicsPhase.MoveChurn]);
+        }
+
+        Assert.That(maxChurn, Is.GreaterThan(0), "move-churn should register across multiple broadphase trees");
+    }
 }
