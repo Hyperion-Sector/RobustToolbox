@@ -215,6 +215,19 @@ public abstract partial class SharedPhysicsSystem
     private const int VelocityConstraintsPerThread = 16;
     private const int PositionConstraintsPerThread = 16;
 
+    // Hyperion: box2d-v3-style graph coloring for the internally-parallel (big) islands. Contacts in a color
+    // share no *dynamic* body, so a color's contacts can be solved in parallel without racing on a body's
+    // velocity slot (the old code raced over arbitrary contact batches). Static/kinematic bodies are exempt
+    // (their velocity writes are no-ops). Keeps the existing 2.x impulse math, so it stays compatible with the
+    // pinned stock client. Buffers reused per-step: big islands solve serially, so one buffer set is race-free.
+    private const int SolverGraphColorCount = 12;
+    private readonly int[] _colorStarts = new int[SolverGraphColorCount + 2]; // [c]..[c+1] = color c range; [12]=overflow start; [13]=total
+    private int _colorCount;
+    private int[] _contactColorOf = Array.Empty<int>();
+    private ulong[] _bodyColorBits = Array.Empty<ulong>();
+    private ContactVelocityConstraint[] _vcSorted = Array.Empty<ContactVelocityConstraint>();
+    private ContactPositionConstraint[] _pcSorted = Array.Empty<ContactPositionConstraint>();
+
     #region Setup
 
     private void InitializeIsland()
@@ -752,6 +765,96 @@ public abstract partial class SharedPhysicsSystem
     /// <summary>
     ///     Go through all the bodies in this island and solve.
     /// </summary>
+    // Hyperion: greedily color the island's contacts (box2d-v3 style) and reorder the velocity/position
+    // constraint arrays so each color occupies a contiguous range. Two contacts get the same color only if they
+    // share no *dynamic* body, so a color's contacts can be solved in parallel without racing on a body's
+    // velocity slot. Contacts that don't fit in SolverGraphColorCount colors land in the overflow range (solved
+    // serially). Result is published in _colorStarts / _colorCount. Only called for internally-parallel islands,
+    // which are solved serially, so the reused buffers are race-free.
+    private void ColorIsland(in IslandData island, ContactVelocityConstraint[] vc, ContactPositionConstraint[] pc, int bodyCount)
+    {
+        var contactCount = island.Contacts.Count;
+
+        if (_contactColorOf.Length < contactCount)
+            Array.Resize(ref _contactColorOf, contactCount);
+        if (_vcSorted.Length < contactCount)
+            Array.Resize(ref _vcSorted, contactCount);
+        if (_pcSorted.Length < contactCount)
+            Array.Resize(ref _pcSorted, contactCount);
+        if (_bodyColorBits.Length < bodyCount)
+            Array.Resize(ref _bodyColorBits, bodyCount);
+
+        Array.Clear(_bodyColorBits, 0, bodyCount);
+        var bodyBits = _bodyColorBits;
+        var colorOf = _contactColorOf;
+
+        const ulong colorMask = (1ul << SolverGraphColorCount) - 1;
+        Span<int> counts = stackalloc int[SolverGraphColorCount + 1];
+        counts.Clear();
+        var maxColor = 0;
+
+        for (var i = 0; i < contactCount; i++)
+        {
+            ref var c = ref vc[i];
+
+            // A body only constrains the coloring if it's dynamic (static/kinematic velocity writes are no-ops).
+            ulong used = 0;
+            if (c.InvMassA > 0f)
+                used |= bodyBits[c.IndexA];
+            if (c.InvMassB > 0f)
+                used |= bodyBits[c.IndexB];
+
+            var avail = ~used & colorMask;
+            int color;
+            if (avail == 0)
+            {
+                color = SolverGraphColorCount; // overflow
+            }
+            else
+            {
+                color = BitOperations.TrailingZeroCount(avail);
+                var bit = 1ul << color;
+                if (c.InvMassA > 0f)
+                    bodyBits[c.IndexA] |= bit;
+                if (c.InvMassB > 0f)
+                    bodyBits[c.IndexB] |= bit;
+                if (color + 1 > maxColor)
+                    maxColor = color + 1;
+            }
+
+            colorOf[i] = color;
+            counts[color]++;
+        }
+
+        // Prefix-sum the counts into per-color start offsets.
+        var starts = _colorStarts;
+        var acc = 0;
+        for (var col = 0; col <= SolverGraphColorCount; col++)
+        {
+            starts[col] = acc;
+            acc += counts[col];
+        }
+        starts[SolverGraphColorCount + 1] = acc; // == contactCount
+
+        // Counting-sort the constraints into color order. vc and pc are reordered by the same permutation, so
+        // pc[k] stays the position constraint for the same contact as vc[k], and the coloring is valid for both.
+        Span<int> cursor = stackalloc int[SolverGraphColorCount + 1];
+        for (var col = 0; col <= SolverGraphColorCount; col++)
+            cursor[col] = starts[col];
+
+        for (var i = 0; i < contactCount; i++)
+        {
+            var pos = cursor[colorOf[i]]++;
+            _vcSorted[pos] = vc[i];
+            _pcSorted[pos] = pc[i];
+        }
+
+        Array.Copy(_vcSorted, vc, contactCount);
+        Array.Copy(_pcSorted, pc, contactCount);
+
+        _colorCount = maxColor;
+    }
+
     private void SolveIsland(
         ref IslandData island,
         in SolverData data,
@@ -822,6 +925,11 @@ public abstract partial class SharedPhysicsSystem
 
         InitializeVelocityConstraints(in data, in island, velocityConstraints, positionConstraints, positions, angles, linearVelocities, angularVelocities);
 
+        // Hyperion: color + reorder constraints for the internally-parallel path (big islands only; small ones
+        // get inter-island parallelism and solve serially internally). Must run after the constraints are built.
+        if (options != null)
+            ColorIsland(in island, velocityConstraints, positionConstraints, bodyCount);
+
         if (data.WarmStarting)
         {
             WarmStart(in data, in island, velocityConstraints, linearVelocities, angularVelocities);
@@ -863,7 +971,7 @@ public abstract partial class SharedPhysicsSystem
                     island.BrokenJoints.Add((island.Joints[j].Original, error));
             }
 
-            SolveVelocityConstraints(in island, options, velocityConstraints, linearVelocities, angularVelocities);
+            SolveVelocityConstraints(in island, options, _colorStarts, _colorCount, velocityConstraints, linearVelocities, angularVelocities);
         }
         PhaseProfiler.AddTicks(PhysicsPhase.ConstraintSolve, Stopwatch.GetTimestamp() - solveStart);
 
@@ -904,7 +1012,7 @@ public abstract partial class SharedPhysicsSystem
         var posStart = Stopwatch.GetTimestamp();
         for (var i = 0; i < data.PositionIterations; i++)
         {
-            var contactsOkay = SolvePositionConstraints(in data, in island, options, positionConstraints, positions, angles);
+            var contactsOkay = SolvePositionConstraints(in data, in island, options, _colorStarts, _colorCount, positionConstraints, positions, angles);
             var jointsOkay = true;
 
             for (var j = 0; j < island.Joints.Count; ++j)
