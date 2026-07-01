@@ -29,23 +29,99 @@ using Robust.Shared.Physics.Collision;
 using Robust.Shared.Physics.Components;
 using Robust.Shared.Physics.Dynamics;
 using Robust.Shared.Physics.Dynamics.Contacts;
+using Robust.Shared.Threading;
 using Robust.Shared.Utility;
 
 namespace Robust.Shared.Physics.Systems;
 
 public abstract partial class SharedPhysicsSystem
 {
+    // Hyperion: batch size for the embarrassingly-parallel prep/store phases (ResetSolver,
+    // InitializeVelocityConstraints, StoreImpulses). These write only their own constraint slot per iteration -
+    // no coloring needed, unlike the Gauss-Seidel velocity/position solve. Reuses the same per-thread granularity
+    // as the graph-colored solve batches for consistency.
+    private const int SolverPrepStoreConstraintsPerThread = 16;
+
     private void ResetSolver(
         in SolverData data,
         in IslandData island,
         ContactVelocityConstraint[] velocityConstraints,
         ContactPositionConstraint[] positionConstraints)
     {
+        // Hyperion: existing (small-island / no options) call sites keep going through the serial path unchanged.
+        ResetSolver(in data, in island, null, velocityConstraints, positionConstraints);
+    }
+
+    /// <summary>
+    /// Hyperion: parallel-capable overload. When <paramref name="options"/> is non-null (big, internally-parallel
+    /// islands only - see SolveIsland in Island.cs), the per-contact prep is batched across worker threads. Each
+    /// iteration only writes velocityConstraints[i]/positionConstraints[i], so unlike the Gauss-Seidel velocity/
+    /// position solve there is no cross-iteration dependency and no coloring is required.
+    /// </summary>
+    private void ResetSolver(
+        in SolverData data,
+        in IslandData island,
+        ParallelOptions? options,
+        ContactVelocityConstraint[] velocityConstraints,
+        ContactPositionConstraint[] positionConstraints)
+    {
         var contactCount = island.Contacts.Count;
 
+        if (options != null && contactCount > SolverPrepStoreConstraintsPerThread * 2)
+        {
+            // Hyperion: was a Parallel.For lambda capturing `in data` / `in island` (CS1628 - can't capture ref
+            // params in a closure). Ports to the engine's record-struct IParallelRobustJob pattern instead
+            // (mirrors PrepareBodiesJob/IntegratePositionsJob in Island.cs and BroadphaseContactJob in
+            // SharedBroadphaseSystem.cs): Data/Island are structs copied by value into the job, so no ref capture
+            // is needed. Same batch math as before (SolverPrepStoreConstraintsPerThread-sized ranges).
+            _parallel.ProcessNow(new ResetSolverJob
+            {
+                System = this,
+                Data = data,
+                Island = island,
+                VelocityConstraints = velocityConstraints,
+                PositionConstraints = positionConstraints,
+            }, contactCount);
+            return;
+        }
+
+        ResetSolverRange(in data, in island, 0, contactCount, velocityConstraints, positionConstraints);
+    }
+
+    // Hyperion: job for the big-island ResetSolver pass. BatchSize matches the old
+    // SolverPrepStoreConstraintsPerThread chunking so batching behavior is unchanged.
+    private record struct ResetSolverJob : IParallelRobustJob
+    {
+        public int BatchSize => SolverPrepStoreConstraintsPerThread;
+
+        public SharedPhysicsSystem System;
+        public SolverData Data;
+        public IslandData Island;
+        public ContactVelocityConstraint[] VelocityConstraints;
+        public ContactPositionConstraint[] PositionConstraints;
+
+        public void Execute(int index)
+        {
+            ExecuteRange(index, index + 1);
+        }
+
+        public void ExecuteRange(int startIndex, int endIndex)
+        {
+            System.ResetSolverRange(in Data, in Island, startIndex, endIndex, VelocityConstraints, PositionConstraints);
+        }
+    }
+
+    private void ResetSolverRange(
+        in SolverData data,
+        in IslandData island,
+        int start,
+        int end,
+        ContactVelocityConstraint[] velocityConstraints,
+        ContactPositionConstraint[] positionConstraints)
+    {
         // Build constraints
         // For now these are going to be bare but will change
-        for (var i = 0; i < contactCount; i++)
+        for (var i = start; i < end; i++)
         {
             var contact = island.Contacts[i];
             Fixture fixtureA = contact.FixtureA!;
@@ -175,12 +251,95 @@ public abstract partial class SharedPhysicsSystem
         Vector2[] linearVelocities,
         float[] angularVelocities)
     {
-        Span<Vector2> points = stackalloc Vector2[2];
+        // Hyperion: existing (small-island / no options) call sites keep going through the serial path unchanged.
+        InitializeVelocityConstraints(in data, in island, null, velocityConstraints, positionConstraints, positions, angles, linearVelocities, angularVelocities);
+    }
+
+    /// <summary>
+    /// Hyperion: parallel-capable overload. Same gating as the ResetSolver overload above - non-null
+    /// <paramref name="options"/> means a big internally-parallel island, and this phase has no ordering
+    /// dependency (each iteration reads/writes only its own constraint index), so it batches cleanly with no
+    /// coloring required, unlike the actual Gauss-Seidel velocity/position solve.
+    /// </summary>
+    private void InitializeVelocityConstraints(
+        in SolverData data,
+        in IslandData island,
+        ParallelOptions? options,
+        ContactVelocityConstraint[] velocityConstraints,
+        ContactPositionConstraint[] positionConstraints,
+        Vector2[] positions,
+        float[] angles,
+        Vector2[] linearVelocities,
+        float[] angularVelocities)
+    {
         var contactCount = island.Contacts.Count;
+
+        if (options != null && contactCount > SolverPrepStoreConstraintsPerThread * 2)
+        {
+            // Hyperion: see ResetSolver above for why this moved off Parallel.For (CS1628 on `in data`/`in
+            // island` capture). Data/Island/the arrays are copied by value into the job struct.
+            _parallel.ProcessNow(new InitializeVelocityConstraintsJob
+            {
+                System = this,
+                Data = data,
+                Island = island,
+                VelocityConstraints = velocityConstraints,
+                PositionConstraints = positionConstraints,
+                Positions = positions,
+                Angles = angles,
+                LinearVelocities = linearVelocities,
+                AngularVelocities = angularVelocities,
+            }, contactCount);
+            return;
+        }
+
+        InitializeVelocityConstraintsRange(in data, in island, 0, contactCount, velocityConstraints, positionConstraints, positions, angles, linearVelocities, angularVelocities);
+    }
+
+    // Hyperion: job for the big-island InitializeVelocityConstraints pass. BatchSize matches the old
+    // SolverPrepStoreConstraintsPerThread chunking so batching behavior is unchanged.
+    private record struct InitializeVelocityConstraintsJob : IParallelRobustJob
+    {
+        public int BatchSize => SolverPrepStoreConstraintsPerThread;
+
+        public SharedPhysicsSystem System;
+        public SolverData Data;
+        public IslandData Island;
+        public ContactVelocityConstraint[] VelocityConstraints;
+        public ContactPositionConstraint[] PositionConstraints;
+        public Vector2[] Positions;
+        public float[] Angles;
+        public Vector2[] LinearVelocities;
+        public float[] AngularVelocities;
+
+        public void Execute(int index)
+        {
+            ExecuteRange(index, index + 1);
+        }
+
+        public void ExecuteRange(int startIndex, int endIndex)
+        {
+            System.InitializeVelocityConstraintsRange(in Data, in Island, startIndex, endIndex, VelocityConstraints, PositionConstraints, Positions, Angles, LinearVelocities, AngularVelocities);
+        }
+    }
+
+    private void InitializeVelocityConstraintsRange(
+        in SolverData data,
+        in IslandData island,
+        int start,
+        int end,
+        ContactVelocityConstraint[] velocityConstraints,
+        ContactPositionConstraint[] positionConstraints,
+        Vector2[] positions,
+        float[] angles,
+        Vector2[] linearVelocities,
+        float[] angularVelocities)
+    {
+        Span<Vector2> points = stackalloc Vector2[2];
         var contacts = island.Contacts;
         var offset = island.Offset;
 
-        for (var i = 0; i < contactCount; ++i)
+        for (var i = start; i < end; ++i)
         {
             ref var velocityConstraint = ref velocityConstraints[i];
             var positionConstraint = positionConstraints[i];
@@ -683,7 +842,58 @@ public abstract partial class SharedPhysicsSystem
 
     private void StoreImpulses(in IslandData island, ContactVelocityConstraint[] velocityConstraints)
     {
-        for (var i = 0; i < island.Contacts.Count; ++i)
+        // Hyperion: existing (small-island / no options) call sites keep going through the serial path unchanged.
+        StoreImpulses(in island, null, velocityConstraints);
+    }
+
+    /// <summary>
+    /// Hyperion: parallel-capable overload. Same gating as ResetSolver/InitializeVelocityConstraints - each
+    /// iteration only writes back into its own contact's manifold (indexed via ContactIndex, no sharing between
+    /// iterations), so there's no ordering dependency and this batches cleanly without coloring.
+    /// </summary>
+    private void StoreImpulses(in IslandData island, ParallelOptions? options, ContactVelocityConstraint[] velocityConstraints)
+    {
+        var contactCount = island.Contacts.Count;
+
+        if (options != null && contactCount > SolverPrepStoreConstraintsPerThread * 2)
+        {
+            // Hyperion: see ResetSolver above for why this moved off Parallel.For (CS1628 on `in island` capture).
+            _parallel.ProcessNow(new StoreImpulsesJob
+            {
+                System = this,
+                Island = island,
+                VelocityConstraints = velocityConstraints,
+            }, contactCount);
+            return;
+        }
+
+        StoreImpulsesRange(in island, 0, contactCount, velocityConstraints);
+    }
+
+    // Hyperion: job for the big-island StoreImpulses pass. BatchSize matches the old
+    // SolverPrepStoreConstraintsPerThread chunking so batching behavior is unchanged.
+    private record struct StoreImpulsesJob : IParallelRobustJob
+    {
+        public int BatchSize => SolverPrepStoreConstraintsPerThread;
+
+        public SharedPhysicsSystem System;
+        public IslandData Island;
+        public ContactVelocityConstraint[] VelocityConstraints;
+
+        public void Execute(int index)
+        {
+            ExecuteRange(index, index + 1);
+        }
+
+        public void ExecuteRange(int startIndex, int endIndex)
+        {
+            System.StoreImpulsesRange(in Island, startIndex, endIndex, VelocityConstraints);
+        }
+    }
+
+    private void StoreImpulsesRange(in IslandData island, int start, int end, ContactVelocityConstraint[] velocityConstraints)
+    {
+        for (var i = start; i < end; ++i)
         {
             ref var velocityConstraint = ref velocityConstraints[i];
             ref var manifold = ref island.Contacts[velocityConstraint.ContactIndex].Manifold;

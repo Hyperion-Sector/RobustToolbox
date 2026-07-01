@@ -9,10 +9,9 @@ namespace Robust.Shared.Physics;
 /// Buckets the physics step into the cost paths an optimization would target. See the physics test suite
 /// design: buckets are defined by target, not call order, so each candidate maps to exactly one.
 ///
-/// WIRED (populated today): Prestep, ContactFind, Narrowphase, ConstraintSolve, MoveChurn.
+/// WIRED (populated today): Prestep, ContactFind, Narrowphase, ConstraintSolve, MoveChurn, Integrate, WriteBack.
 /// RESERVED (declared for the taxonomy but not yet timed — they report 0 until a later plan wires their
-/// seam; a 0 series means "not measured yet", NOT "free"): GridQuery, IslandBuild, ConstraintPrep,
-/// Integrate, WriteBack.
+/// seam; a 0 series means "not measured yet", NOT "free"): GridQuery, IslandBuild, ConstraintPrep.
 /// </summary>
 public enum PhysicsPhase
 {

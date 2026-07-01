@@ -10,6 +10,7 @@ using Robust.Shared.Physics.Components;
 using Robust.Shared.Physics.Dynamics;
 using Robust.Shared.Physics.Dynamics.Contacts;
 using Robust.Shared.Physics.Dynamics.Joints;
+using Robust.Shared.Threading;
 using Robust.Shared.Utility;
 
 namespace Robust.Shared.Physics.Systems;
@@ -220,8 +221,11 @@ public abstract partial class SharedPhysicsSystem
     // velocity slot (the old code raced over arbitrary contact batches). Static/kinematic bodies are exempt
     // (their velocity writes are no-ops). Keeps the existing 2.x impulse math, so it stays compatible with the
     // pinned stock client. Buffers reused per-step: big islands solve serially, so one buffer set is race-free.
-    private const int SolverGraphColorCount = 12;
-    private readonly int[] _colorStarts = new int[SolverGraphColorCount + 2]; // [c]..[c+1] = color c range; [12]=overflow start; [13]=total
+    // Hyperion: raised 12 -> 24 (A5). The bitmask is a ulong (64 bits of headroom to spare); more colors
+    // shrink the always-serial overflow range on high-contact big islands. Shifts which contacts land in
+    // overflow vs. get a color, so solve order changes slightly -> sub-epsilon float drift only.
+    private const int SolverGraphColorCount = 24;
+    private readonly int[] _colorStarts = new int[SolverGraphColorCount + 2]; // [c]..[c+1] = color c range; [24]=overflow start; [25]=total
     private int _colorCount;
     private int[] _contactColorOf = Array.Empty<int>();
     private ulong[] _bodyColorBits = Array.Empty<ulong>();
@@ -726,6 +730,9 @@ public abstract partial class SharedPhysicsSystem
         });
 
         // Update data sequentially
+        // Hyperion: WriteBack bucket (A2) = the post-solve write-back only (UpdateBodies + SleepBodies);
+        // matches the existing ConstraintSolve Stopwatch/AddTicks idiom used in SolveIsland below.
+        var writeBackStart = Stopwatch.GetTimestamp();
         for (var i = 0; i < islandCount; i++)
         {
             ref readonly var island = ref actualIslands[i];
@@ -733,6 +740,7 @@ public abstract partial class SharedPhysicsSystem
             UpdateBodies(in island, solvedPositions, solvedAngles, linearVelocities, angularVelocities);
             SleepBodies(in island, sleepStatus);
         }
+        PhaseProfiler.AddTicks(PhysicsPhase.WriteBack, Stopwatch.GetTimestamp() - writeBackStart);
 
         // Cleanup
         ArrayPool<Vector2>.Shared.Return(solvedPositions);
@@ -871,49 +879,32 @@ public abstract partial class SharedPhysicsSystem
         var angles = ArrayPool<float>.Shared.Rent(bodyCount);
         var offset = island.Offset;
         var gravity = Gravity;
+        var bodies = island.Bodies;
 
-
-        for (var i = 0; i < island.Bodies.Count; i++)
+        // Hyperion (A3): prep loop (gravity/force/damping + world->local snapshot) writes only to its own
+        // index (positions[i]/angles[i]/linearVelocities[i+offset]/angularVelocities[i+offset]), so it's
+        // race-free to run in parallel the same way FinalisePositions already is. Gated on options != null,
+        // the same gate ColorIsland uses below: that's only true on the internally-parallel big-island path.
+        // Small islands get inter-island parallelism instead and must stay serial here to avoid nesting
+        // Parallel.For inside an already-parallel-dispatched island solve.
+        if (options != null)
         {
-            var bodyEnt = island.Bodies[i];
-            var body = bodyEnt.Comp1;
-            var xform = bodyEnt.Comp2;
-            var (worldPos, worldRot) =
-                _transform.GetWorldPositionRotation(xform);
-
-            var transform = new Transform(worldPos, worldRot);
-            var position = Physics.Transform.Mul(transform, body.LocalCenter);
-            // DebugTools.Assert(!float.IsNaN(position.X) && !float.IsNaN(position.Y));
-            var angle = transform.Quaternion2D.Angle;
-
-            // var bodyTransform = body.GetTransform();
-            // DebugTools.Assert(bodyTransform.Position.EqualsApprox(position) && MathHelper.CloseTo(angle, bodyTransform.Quaternion2D.Angle));
-
-            var linearVelocity = body.LinearVelocity;
-            var angularVelocity = body.AngularVelocity;
-
-            // if the body cannot move, nothing to do here
-            if (body.BodyType == BodyType.Dynamic)
+            _parallel.ProcessNow(new PrepareBodiesJob
             {
-                if (body.IgnoreGravity)
-                {
-                    linearVelocity += body.Force * data.FrameTime * body.InvMass;
-                }
-                else
-                {
-                    linearVelocity += (gravity + body.Force * body.InvMass) * data.FrameTime;
-                }
-
-                angularVelocity += body.InvI * body.Torque * data.FrameTime;
-
-                linearVelocity *= Math.Clamp(1.0f - data.FrameTime * body.LinearDamping, 0.0f, 1.0f);
-                angularVelocity *= Math.Clamp(1.0f - data.FrameTime * body.AngularDamping, 0.0f, 1.0f);
-            }
-
-            positions[i] = position;
-            angles[i] = angle;
-            linearVelocities[i + offset] = linearVelocity;
-            angularVelocities[i + offset] = angularVelocity;
+                System = this,
+                Data = data,
+                Offset = offset,
+                Gravity = gravity,
+                Bodies = bodies,
+                Positions = positions,
+                Angles = angles,
+                LinearVelocities = linearVelocities,
+                AngularVelocities = angularVelocities,
+            }, bodyCount);
+        }
+        else
+        {
+            PrepareBodies(0, bodyCount, offset, gravity, in data, bodies, positions, angles, linearVelocities, angularVelocities);
         }
 
         var contactCount = island.Contacts.Count;
@@ -921,9 +912,9 @@ public abstract partial class SharedPhysicsSystem
         var positionConstraints = ArrayPool<ContactPositionConstraint>.Shared.Rent(contactCount);
 
         // Pass the data into the solver
-        ResetSolver(in data, in island, velocityConstraints, positionConstraints);
+        ResetSolver(in data, in island, options, velocityConstraints, positionConstraints);
 
-        InitializeVelocityConstraints(in data, in island, velocityConstraints, positionConstraints, positions, angles, linearVelocities, angularVelocities);
+        InitializeVelocityConstraints(in data, in island, options, velocityConstraints, positionConstraints, positions, angles, linearVelocities, angularVelocities);
 
         // Hyperion: color + reorder constraints for the internally-parallel path (big islands only; small ones
         // get inter-island parallelism and solve serially internally). Must run after the constraints are built.
@@ -976,7 +967,7 @@ public abstract partial class SharedPhysicsSystem
         PhaseProfiler.AddTicks(PhysicsPhase.ConstraintSolve, Stopwatch.GetTimestamp() - solveStart);
 
         // Store for warm starting.
-        StoreImpulses(in island, velocityConstraints);
+        StoreImpulses(in island, options, velocityConstraints);
 
         var maxVel = data.MaxTranslation / data.FrameTime;
         var maxVelSq = maxVel * maxVel;
@@ -984,28 +975,35 @@ public abstract partial class SharedPhysicsSystem
         var maxAngVelSq = maxAngVel * maxAngVel;
 
         // Integrate positions
-        for (var i = 0; i < bodyCount; i++)
+        // Hyperion: Integrate bucket (A2) = the position-integration loop only. This runs per-island, possibly
+        // concurrently with other islands under the outer Parallel.For in SolveIslands, so AddTicks' Interlocked.Add
+        // keeps this race-free the same way ConstraintSolve already is.
+        // A3: each index only touches its own linearVelocities[offset+i]/angularVelocities[offset+i]/
+        // positions[i]/angles[i] slot, so (like PrepareBodies) it's race-free to fan out on the internally-
+        // parallel big-island path. Same options != null gate as everywhere else in this method.
+        var integrateStart = Stopwatch.GetTimestamp();
+        if (options != null)
         {
-            var linearVelocity = linearVelocities[offset + i];
-            var angularVelocity = angularVelocities[offset + i];
-
-            var velSqr = linearVelocity.LengthSquared();
-            if (velSqr > maxVelSq)
+            _parallel.ProcessNow(new IntegratePositionsJob
             {
-                linearVelocity *= maxVel / MathF.Sqrt(velSqr);
-                linearVelocities[offset + i] = linearVelocity;
-            }
-
-            if (angularVelocity * angularVelocity > maxAngVelSq)
-            {
-                angularVelocity *= maxAngVel / MathF.Abs(angularVelocity);
-                angularVelocities[offset + i] = angularVelocity;
-            }
-
-            // Integrate
-            positions[i] += linearVelocity * data.FrameTime;
-            angles[i] += angularVelocity * data.FrameTime;
+                System = this,
+                Offset = offset,
+                FrameTime = data.FrameTime,
+                MaxVel = maxVel,
+                MaxVelSq = maxVelSq,
+                MaxAngVel = maxAngVel,
+                MaxAngVelSq = maxAngVelSq,
+                Positions = positions,
+                Angles = angles,
+                LinearVelocities = linearVelocities,
+                AngularVelocities = angularVelocities,
+            }, bodyCount);
         }
+        else
+        {
+            IntegratePositions(0, bodyCount, offset, data.FrameTime, maxVel, maxVelSq, maxAngVel, maxAngVelSq, positions, angles, linearVelocities, angularVelocities);
+        }
+        PhaseProfiler.AddTicks(PhysicsPhase.Integrate, Stopwatch.GetTimestamp() - integrateStart);
 
         island.PositionSolved = false;
 
@@ -1038,55 +1036,28 @@ public abstract partial class SharedPhysicsSystem
         // Transform the solved positions back into local terms
         // This means we can run the entire solver in parallel and not have to worry about stale world positions later
         // E.g. if a parent had its position updated then our worldposition is invalid
-        // We can safely do this in parallel.
-
-        // Solve positions now and store for later; we can't write this safely in parallel.
-        var bodies = island.Bodies;
+        // We can safely do this in parallel, and (A7) do: each index writes only its own
+        // solvedPositions[offset+i]/solvedAngles[offset+i] slot, so batches never race.
+        // (bodies == island.Bodies, already captured above for the PrepareBodies pass.)
 
         if (options != null)
         {
-            // Isolate to avoid delegate capture allocation unless we're actually processing parallel here.
-            static void ProcessParallelInternal(
-                SharedPhysicsSystem system,
-                ParallelOptions options,
-                int bodyCount,
-                int offset,
-                List<Entity<PhysicsComponent, TransformComponent>> bodies,
-                Vector2[] positions,
-                float[] angles,
-                Vector2[] solvedPositions,
-                float[] solvedAngles)
+            // Hyperion (A7): was a static local `ProcessParallelInternal` wrapping a `Parallel.For` with a
+            // captured lambda, allocating a closure every big-island tick. Converted to the engine's own
+            // IParallelRobustJob record-struct pattern (mirrors ManifoldsJob in Contacts.cs / BroadphaseContactJob
+            // in SharedBroadphaseSystem.cs): a value-type job dispatched via `_parallel.ProcessNow`, which batches
+            // internally at BatchSize just like the old FinaliseBodies=32 chunking did, but through the engine's
+            // own ThreadPool-based job queue instead of TPL Parallel.For, and with no per-tick delegate allocation.
+            _parallel.ProcessNow(new FinalisePositionsJob
             {
-                const int FinaliseBodies = 32;
-                var batches = (int)MathF.Ceiling((float) bodyCount / FinaliseBodies);
-
-                Parallel.For(0, batches, options, i =>
-                {
-                    var start = i * FinaliseBodies;
-                    var end = Math.Min(bodyCount, start + FinaliseBodies);
-
-                    system.FinalisePositions(
-                        start,
-                        end,
-                        offset,
-                        bodies,
-                        positions,
-                        angles,
-                        solvedPositions,
-                        solvedAngles);
-                });
-            }
-
-            ProcessParallelInternal(
-                this,
-                options,
-                bodyCount,
-                offset,
-                bodies,
-                positions,
-                angles,
-                solvedPositions,
-                solvedAngles);
+                System = this,
+                Offset = offset,
+                Bodies = bodies,
+                Positions = positions,
+                Angles = angles,
+                SolvedPositions = solvedPositions,
+                SolvedAngles = solvedAngles,
+            }, bodyCount);
         }
         else
         {
@@ -1170,6 +1141,171 @@ public abstract partial class SharedPhysicsSystem
         ArrayPool<ContactPositionConstraint>.Shared.Return(positionConstraints);
     }
 
+    /// <summary>
+    /// Snapshots world position/rotation into local (positions/angles), and applies gravity/force/damping into
+    /// linearVelocities/angularVelocities, for bodies [start, end) of the island. Each index writes only its
+    /// own slot, so this is safe to call over disjoint ranges concurrently (see PrepareBodiesJob).
+    /// </summary>
+    private void PrepareBodies(
+        int start,
+        int end,
+        int offset,
+        Vector2 gravity,
+        in SolverData data,
+        List<Entity<PhysicsComponent, TransformComponent>> bodies,
+        Vector2[] positions,
+        float[] angles,
+        Vector2[] linearVelocities,
+        float[] angularVelocities)
+    {
+        for (var i = start; i < end; i++)
+        {
+            var bodyEnt = bodies[i];
+            var body = bodyEnt.Comp1;
+            var xform = bodyEnt.Comp2;
+            var (worldPos, worldRot) =
+                _transform.GetWorldPositionRotation(xform);
+
+            var transform = new Transform(worldPos, worldRot);
+            var position = Physics.Transform.Mul(transform, body.LocalCenter);
+            // DebugTools.Assert(!float.IsNaN(position.X) && !float.IsNaN(position.Y));
+            var angle = transform.Quaternion2D.Angle;
+
+            // var bodyTransform = body.GetTransform();
+            // DebugTools.Assert(bodyTransform.Position.EqualsApprox(position) && MathHelper.CloseTo(angle, bodyTransform.Quaternion2D.Angle));
+
+            var linearVelocity = body.LinearVelocity;
+            var angularVelocity = body.AngularVelocity;
+
+            // if the body cannot move, nothing to do here
+            if (body.BodyType == BodyType.Dynamic)
+            {
+                if (body.IgnoreGravity)
+                {
+                    linearVelocity += body.Force * data.FrameTime * body.InvMass;
+                }
+                else
+                {
+                    linearVelocity += (gravity + body.Force * body.InvMass) * data.FrameTime;
+                }
+
+                angularVelocity += body.InvI * body.Torque * data.FrameTime;
+
+                linearVelocity *= Math.Clamp(1.0f - data.FrameTime * body.LinearDamping, 0.0f, 1.0f);
+                angularVelocity *= Math.Clamp(1.0f - data.FrameTime * body.AngularDamping, 0.0f, 1.0f);
+            }
+
+            positions[i] = position;
+            angles[i] = angle;
+            linearVelocities[i + offset] = linearVelocity;
+            angularVelocities[i + offset] = angularVelocity;
+        }
+    }
+
+    // Hyperion (A3): job for the big-island body-prep pass. Range-based (like FinalisePositionsJob) so each
+    // batch calls PrepareBodies once over its whole slice instead of dispatching per-body.
+    // Implements IParallelRobustJob (not just IParallelRangeRobustJob) since IParallelManager.ProcessNow only
+    // dispatches the former; Execute(int) is a one-index-range fallback that ExecuteRange (the actual batched
+    // path used by ProcessNow) overrides, mirroring BroadphaseContactJob / ManifoldsJob.
+    private record struct PrepareBodiesJob : IParallelRobustJob
+    {
+        public int BatchSize => 32;
+
+        public SharedPhysicsSystem System;
+        public SolverData Data;
+        public int Offset;
+        public Vector2 Gravity;
+        public List<Entity<PhysicsComponent, TransformComponent>> Bodies;
+        public Vector2[] Positions;
+        public float[] Angles;
+        public Vector2[] LinearVelocities;
+        public float[] AngularVelocities;
+
+        public void Execute(int index)
+        {
+            ExecuteRange(index, index + 1);
+        }
+
+        public void ExecuteRange(int startIndex, int endIndex)
+        {
+            System.PrepareBodies(startIndex, endIndex, Offset, Gravity, in Data, Bodies, Positions, Angles, LinearVelocities, AngularVelocities);
+        }
+    }
+
+    /// <summary>
+    /// Clamps linear/angular velocity to the max-per-tick limits and integrates positions/angles for bodies
+    /// [start, end) of the island. Each index writes only its own slot, so this is safe to call over disjoint
+    /// ranges concurrently (see IntegratePositionsJob).
+    /// </summary>
+    private void IntegratePositions(
+        int start,
+        int end,
+        int offset,
+        float frameTime,
+        float maxVel,
+        float maxVelSq,
+        float maxAngVel,
+        float maxAngVelSq,
+        Vector2[] positions,
+        float[] angles,
+        Vector2[] linearVelocities,
+        float[] angularVelocities)
+    {
+        for (var i = start; i < end; i++)
+        {
+            var linearVelocity = linearVelocities[offset + i];
+            var angularVelocity = angularVelocities[offset + i];
+
+            var velSqr = linearVelocity.LengthSquared();
+            if (velSqr > maxVelSq)
+            {
+                linearVelocity *= maxVel / MathF.Sqrt(velSqr);
+                linearVelocities[offset + i] = linearVelocity;
+            }
+
+            if (angularVelocity * angularVelocity > maxAngVelSq)
+            {
+                angularVelocity *= maxAngVel / MathF.Abs(angularVelocity);
+                angularVelocities[offset + i] = angularVelocity;
+            }
+
+            // Integrate
+            positions[i] += linearVelocity * frameTime;
+            angles[i] += angularVelocity * frameTime;
+        }
+    }
+
+    // Hyperion (A3): job for the big-island position-integrate pass. Range-based like PrepareBodiesJob /
+    // FinalisePositionsJob.
+    // Implements IParallelRobustJob (see PrepareBodiesJob comment above) for the same reason: ProcessNow
+    // requires it, ExecuteRange stays the real batched worker.
+    private record struct IntegratePositionsJob : IParallelRobustJob
+    {
+        public int BatchSize => 32;
+
+        public SharedPhysicsSystem System;
+        public int Offset;
+        public float FrameTime;
+        public float MaxVel;
+        public float MaxVelSq;
+        public float MaxAngVel;
+        public float MaxAngVelSq;
+        public Vector2[] Positions;
+        public float[] Angles;
+        public Vector2[] LinearVelocities;
+        public float[] AngularVelocities;
+
+        public void Execute(int index)
+        {
+            ExecuteRange(index, index + 1);
+        }
+
+        public void ExecuteRange(int startIndex, int endIndex)
+        {
+            System.IntegratePositions(startIndex, endIndex, Offset, FrameTime, MaxVel, MaxVelSq, MaxAngVel, MaxAngVelSq, Positions, Angles, LinearVelocities, AngularVelocities);
+        }
+    }
+
     private void FinalisePositions(int start, int end, int offset, List<Entity<PhysicsComponent, TransformComponent>> bodies, Vector2[] positions, float[] angles, Vector2[] solvedPositions, float[] solvedAngles)
     {
         for (var i = start; i < end; i++)
@@ -1197,6 +1333,34 @@ public abstract partial class SharedPhysicsSystem
             var solvedPosition = Vector2.Transform(adjustedPosition, parentInvMatrix);
             solvedPositions[offset + i] = solvedPosition - xform.LocalPosition;
             solvedAngles[offset + i] = angle - worldRot;
+        }
+    }
+
+    // Hyperion (A7): job for the big-island position finalise pass. Implements IParallelRobustJob because
+    // IParallelManager.ProcessNow only accepts that interface (not the range-only IParallelRangeRobustJob);
+    // ExecuteRange is overridden so each batch still calls FinalisePositions once over its whole [start, end)
+    // slice, matching the old FinaliseBodies=32 chunking exactly. Each index range writes only to its own
+    // slots in solvedPositions/solvedAngles, so batches never race.
+    private record struct FinalisePositionsJob : IParallelRobustJob
+    {
+        public int BatchSize => 32;
+
+        public SharedPhysicsSystem System;
+        public int Offset;
+        public List<Entity<PhysicsComponent, TransformComponent>> Bodies;
+        public Vector2[] Positions;
+        public float[] Angles;
+        public Vector2[] SolvedPositions;
+        public float[] SolvedAngles;
+
+        public void Execute(int index)
+        {
+            ExecuteRange(index, index + 1);
+        }
+
+        public void ExecuteRange(int startIndex, int endIndex)
+        {
+            System.FinalisePositions(startIndex, endIndex, Offset, Bodies, Positions, Angles, SolvedPositions, SolvedAngles);
         }
     }
 
