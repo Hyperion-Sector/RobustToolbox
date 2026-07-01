@@ -166,7 +166,7 @@ namespace Robust.Shared.Physics.Systems
         internal void FindNewContacts()
         {
             _contactJob.FrameTime = _frameTime;
-            _contactJob.Pairs.Clear();
+            _contactJob.Reset();
 
             var moveBuffer = _physicsSystem.MoveBuffer;
             var movedGrids = _physicsSystem.MovedGrids;
@@ -200,7 +200,15 @@ namespace Robust.Shared.Physics.Systems
 
             var count = moveBuffer.Count;
 
+            // Scale batch size with available worker threads (A6) rather than a fixed magic constant, so we
+            // partition work to roughly match ParallelProcessCount instead of over/under-batching on machines
+            // with very few or very many cores. Still floored at the old default of 16 so we don't regress to
+            // pathologically tiny batches (each batch does grid queries + FindPairs, not free) on low-count ticks.
+            _contactJob.BatchSize = Math.Max(16, (int) MathF.Ceiling(count / (float) _parallel.ParallelProcessCount));
+            _contactJob.PrepareBatches(count);
+
             _parallel.ProcessNow(_contactJob, count);
+            _contactJob.MergeBuffers();
 
             foreach (var (proxyA, proxyB, flags) in _contactJob.Pairs)
             {
@@ -449,8 +457,6 @@ namespace Robust.Shared.Physics.Systems
                 //if (!tuple.proxy.Fixture.Hard || !other.Fixture.Hard)
                 //    return true;
 
-                // TODO: Check if interlocked + array is better here which is what box2d does
-                // It then just heap allocates anything over the array size.
                 var flags = PairFlag.None;
                 if (tuple.proxy.Fixture.Hard &&
                     other.Fixture.Hard &&
@@ -459,10 +465,10 @@ namespace Robust.Shared.Physics.Systems
                     flags |= PairFlag.Wake;
                 }
 
-                lock (tuple.pairs)
-                {
-                    tuple.pairs.Add((tuple.proxy, other, flags));
-                }
+                // No lock: box2d-v3 style task-local buffer. `tuple.pairs` is the calling batch's own
+                // scratch list (see BroadphaseContactJob.ExecuteRange / _batchBuffers) which no other
+                // worker thread touches until BroadphaseContactJob.MergeBuffers runs serially afterwards.
+                tuple.pairs.Add((tuple.proxy, other, flags));
 
                 return true;
             }, aabb, true);
@@ -602,15 +608,100 @@ namespace Robust.Shared.Physics.Systems
 
             public readonly List<FixtureProxy> MoveBuffer = new();
 
+            /// <summary>
+            /// Final merged set of pairs found this tick. Only valid to read after <see cref="MergeBuffers"/>
+            /// has been called (i.e. after ProcessNow/ProcessSerialNow returns).
+            /// </summary>
             public List<(FixtureProxy, FixtureProxy, PairFlag)> Pairs = new(64);
+
+            /// <summary>
+            /// Per-batch scratch buffers. box2d-v3 style: each parallel batch (a single ExecuteRange call,
+            /// i.e. a single worker) writes to its own list with zero shared mutable state, avoiding any
+            /// lock in the hot loop. Indexed by batch number (startIndex / BatchSize). Pre-sized by
+            /// <see cref="PrepareBatches"/> before the parallel job starts (never grown mid-flight, since
+            /// concurrent List&lt;T&gt; growth from multiple worker threads would race). Merged serially into
+            /// <see cref="Pairs"/> in batch order after the parallel job completes so pair ordering stays
+            /// deterministic run-to-run for a given MoveBuffer + BatchSize.
+            /// </summary>
+            private readonly List<List<(FixtureProxy, FixtureProxy, PairFlag)>> _batchBuffers = new();
 
             public float FrameTime;
 
             // Box2D uses 64 but we have to do grid queries for each fixtureproxy which will add a fair bit of overhead.
             // Plus we also run events + trycomp for joints on top.
-            public int BatchSize => 16;
+            // Scaled by ParallelProcessCount (rather than a hardcoded constant) so the batch count roughly
+            // matches available worker threads instead of over- or under-partitioning on machines with very
+            // few or very many cores.
+            public int BatchSize = 16;
+
+            /// <summary>
+            /// Resets per-tick state. Must be called before re-using this job for a new FindNewContacts pass.
+            /// </summary>
+            public void Reset()
+            {
+                Pairs.Clear();
+                foreach (var buffer in _batchBuffers)
+                {
+                    buffer.Clear();
+                }
+            }
+
+            /// <summary>
+            /// Pre-allocates one scratch buffer per batch for <paramref name="count"/> elements at the
+            /// current <see cref="BatchSize"/>. Must be called serially (on the main thread) before
+            /// ProcessNow/ProcessSerialNow kicks off the parallel job: ExecuteRange only ever *indexes*
+            /// into <see cref="_batchBuffers"/>, it never grows it, so growing the list concurrently from
+            /// multiple worker threads (a real List&lt;T&gt; corruption hazard) can't happen.
+            /// </summary>
+            public void PrepareBatches(int count)
+            {
+                var batches = BatchSize > 0 ? (count + BatchSize - 1) / BatchSize : 1;
+                batches = Math.Max(batches, 1);
+
+                while (_batchBuffers.Count < batches)
+                {
+                    _batchBuffers.Add(new List<(FixtureProxy, FixtureProxy, PairFlag)>());
+                }
+            }
+
+            public void ExecuteRange(int startIndex, int endIndex)
+            {
+                // batchIndex must land inside the range pre-allocated by PrepareBatches; ExecuteRange never
+                // grows _batchBuffers itself since that would race against other in-flight worker threads.
+                var batchIndex = BatchSize > 0 ? startIndex / BatchSize : 0;
+                var localPairs = _batchBuffers[batchIndex];
+
+                for (var i = startIndex; i < endIndex; i++)
+                {
+                    Execute(i, localPairs);
+                }
+            }
+
+            /// <summary>
+            /// Merges all per-batch buffers into <see cref="Pairs"/> serially, in ascending batch order, so
+            /// downstream consumption order is deterministic regardless of which worker thread finished first.
+            /// Must be called after ProcessNow/ProcessSerialNow returns and before reading <see cref="Pairs"/>.
+            /// </summary>
+            public void MergeBuffers()
+            {
+                foreach (var buffer in _batchBuffers)
+                {
+                    if (buffer.Count == 0)
+                        continue;
+
+                    Pairs.AddRange(buffer);
+                }
+            }
 
             public void Execute(int index)
+            {
+                // Not used directly: ExecuteRange is overridden above so every index in a batch shares that
+                // batch's local buffer instead of the shared Pairs list. Kept for IParallelRobustJob interface
+                // compliance and as a serial fallback (routes through Pairs directly, no batching involved).
+                Execute(index, Pairs);
+            }
+
+            private void Execute(int index, List<(FixtureProxy, FixtureProxy, PairFlag)> pairBuffer)
             {
                 var proxy = MoveBuffer[index];
                 var broadphaseUid = XformQuery.GetComponent(proxy.Entity).Broadphase?.Uid;
@@ -623,7 +714,7 @@ namespace Robust.Shared.Physics.Systems
                 var proxyBody = proxy.Body;
                 DebugTools.Assert(!proxyBody.Deleted);
 
-                var state = (System, proxy, worldAABB, Pairs);
+                var state = (System, proxy, worldAABB, pairBuffer);
 
                 // Get every broadphase we may be intersecting.
                 MapManager.FindGridsIntersecting(mapUid, worldAABB.Enlarged(broadphaseExpand), ref state,
@@ -641,7 +732,7 @@ namespace Robust.Shared.Physics.Systems
                     includeMap: false);
 
                 // Struct ref moment, I have no idea what's fastest.
-                System.FindPairs(proxy, worldAABB, mapUid, Pairs);
+                System.FindPairs(proxy, worldAABB, mapUid, pairBuffer);
             }
         }
 
