@@ -92,4 +92,20 @@ public class PhysicsBenchmark
     public void MultiMap() => PhysicsScenarios.Step(_multiMapSim, PhysicsScenarios.DefaultTicks);
 
     #endregion
+
+    #region BigPyramid
+
+    private ISimulation _bigPyramidSim = default!;
+
+    [GlobalSetup(Target = nameof(BigPyramid))]
+    public void BigPyramidSetup()
+    {
+        _bigPyramidSim = RobustServerSimulation.NewSimulation().InitializeInstance();
+        PhysicsScenarios.BuildBigPyramid(_bigPyramidSim);
+    }
+
+    [Benchmark]
+    public void BigPyramid() => PhysicsScenarios.Step(_bigPyramidSim, PhysicsScenarios.BigPyramidTicks);
+
+    #endregion
 }

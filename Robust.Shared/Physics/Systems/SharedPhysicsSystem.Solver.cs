@@ -334,44 +334,64 @@ public abstract partial class SharedPhysicsSystem
     private static void SolveVelocityConstraints(
         in IslandData island,
         ParallelOptions? options,
+        int[] colorStarts,
+        int colorCount,
         ContactVelocityConstraint[] velocityConstraints,
         Vector2[] linearVelocities,
         float[] angularVelocities)
     {
-        var contactCount = island.Contacts.Count;
-
-        if (options != null && contactCount > VelocityConstraintsPerThread * 2)
+        // Hyperion: graph-colored parallel solve for the internally-parallel (big) islands - contacts within a
+        // color share no dynamic body, so each color solves in parallel without racing (the old path raced over
+        // arbitrary contact batches). Small islands (options == null) get inter-island parallelism and run serial
+        // here. The per-contact math is unchanged, so results stay compatible with the pinned stock client.
+        if (options != null)
         {
-            static void ProcessParallelInternal(
-                IslandData island,
-                int contactCount,
-                ParallelOptions options,
-                ContactVelocityConstraint[] velocityConstraints,
-                Vector2[] linearVelocities,
-                float[] angularVelocities)
-            {
-                var batches = (int) Math.Ceiling((float) contactCount / VelocityConstraintsPerThread);
-
-                Parallel.For(0, batches, options, i =>
-                {
-                    var start = i * VelocityConstraintsPerThread;
-                    var end = Math.Min(start + VelocityConstraintsPerThread, contactCount);
-                    SolveVelocityConstraints(island, start, end, velocityConstraints, linearVelocities, angularVelocities);
-                });
-            }
-
-            ProcessParallelInternal(
-                island,
-                contactCount,
-                options,
-                velocityConstraints,
-                linearVelocities,
-                angularVelocities);
+            SolveVelocityConstraintsGraph(island, options, colorStarts, colorCount, velocityConstraints, linearVelocities, angularVelocities);
         }
         else
         {
-            SolveVelocityConstraints(in island, 0, contactCount, velocityConstraints, linearVelocities, angularVelocities);
+            SolveVelocityConstraints(in island, 0, island.Contacts.Count, velocityConstraints, linearVelocities, angularVelocities);
         }
+    }
+
+    private static void SolveVelocityConstraintsGraph(
+        IslandData island,
+        ParallelOptions options,
+        int[] colorStarts,
+        int colorCount,
+        ContactVelocityConstraint[] velocityConstraints,
+        Vector2[] linearVelocities,
+        float[] angularVelocities)
+    {
+        for (var c = 0; c < colorCount; c++)
+        {
+            var start = colorStarts[c];
+            var end = colorStarts[c + 1];
+            var count = end - start;
+            if (count <= 0)
+                continue;
+
+            if (count > VelocityConstraintsPerThread * 2)
+            {
+                var batches = (int) Math.Ceiling((float) count / VelocityConstraintsPerThread);
+                Parallel.For(0, batches, options, b =>
+                {
+                    var bStart = start + b * VelocityConstraintsPerThread;
+                    var bEnd = Math.Min(bStart + VelocityConstraintsPerThread, end);
+                    SolveVelocityConstraints(island, bStart, bEnd, velocityConstraints, linearVelocities, angularVelocities);
+                });
+            }
+            else
+            {
+                SolveVelocityConstraints(in island, start, end, velocityConstraints, linearVelocities, angularVelocities);
+            }
+        }
+
+        // Overflow contacts (couldn't be colored within the graph) are solved serially last.
+        var oStart = colorStarts[SolverGraphColorCount];
+        var oEnd = colorStarts[SolverGraphColorCount + 1];
+        if (oEnd > oStart)
+            SolveVelocityConstraints(in island, oStart, oEnd, velocityConstraints, linearVelocities, angularVelocities);
     }
 
     private static void SolveVelocityConstraints(
@@ -683,43 +703,70 @@ public abstract partial class SharedPhysicsSystem
         in SolverData data,
         in IslandData island,
         ParallelOptions? options,
+        int[] colorStarts,
+        int colorCount,
         ContactPositionConstraint[] positionConstraints,
         Vector2[] positions,
         float[] angles)
     {
-        var contactCount = island.Contacts.Count;
-
-        // Parallel
-        if (options != null && contactCount > PositionConstraintsPerThread * 2)
+        // Hyperion: graph-colored parallel position solve for big islands (race-free); serial for small ones.
+        if (options != null)
         {
-            static bool ProcessParallelInternal(
-                int contactCount,
-                SolverData data,
-                ParallelOptions options,
-                ContactPositionConstraint[] positionConstraints,
-                Vector2[] positions,
-                float[] angles)
-            {
-                var unsolved = 0;
-                var batches = (int) Math.Ceiling((float) contactCount / PositionConstraintsPerThread);
-
-                Parallel.For(0, batches, options, i =>
-                {
-                    var start = i * PositionConstraintsPerThread;
-                    var end = Math.Min(start + PositionConstraintsPerThread, contactCount);
-
-                    if (!SolvePositionConstraints(data, start, end, positionConstraints, positions, angles))
-                        Interlocked.Increment(ref unsolved);
-                });
-
-                return unsolved == 0;
-            }
-
-            return ProcessParallelInternal(contactCount, data, options, positionConstraints, positions, angles);
+            return SolvePositionConstraintsGraph(data, island, options, colorStarts, colorCount, positionConstraints, positions, angles);
         }
 
-        // No parallel
-        return SolvePositionConstraints(data, 0, contactCount, positionConstraints, positions, angles);
+        return SolvePositionConstraints(data, 0, island.Contacts.Count, positionConstraints, positions, angles);
+    }
+
+    private static bool SolvePositionConstraintsGraph(
+        SolverData data,
+        IslandData island,
+        ParallelOptions options,
+        int[] colorStarts,
+        int colorCount,
+        ContactPositionConstraint[] positionConstraints,
+        Vector2[] positions,
+        float[] angles)
+    {
+        var unsolved = 0;
+
+        for (var c = 0; c < colorCount; c++)
+        {
+            var start = colorStarts[c];
+            var end = colorStarts[c + 1];
+            var count = end - start;
+            if (count <= 0)
+                continue;
+
+            if (count > PositionConstraintsPerThread * 2)
+            {
+                var batches = (int) Math.Ceiling((float) count / PositionConstraintsPerThread);
+                Parallel.For(0, batches, options, b =>
+                {
+                    var bStart = start + b * PositionConstraintsPerThread;
+                    var bEnd = Math.Min(bStart + PositionConstraintsPerThread, end);
+
+                    if (!SolvePositionConstraints(data, bStart, bEnd, positionConstraints, positions, angles))
+                        Interlocked.Increment(ref unsolved);
+                });
+            }
+            else
+            {
+                if (!SolvePositionConstraints(data, start, end, positionConstraints, positions, angles))
+                    unsolved++;
+            }
+        }
+
+        // Overflow contacts solved serially last.
+        var oStart = colorStarts[SolverGraphColorCount];
+        var oEnd = colorStarts[SolverGraphColorCount + 1];
+        if (oEnd > oStart)
+        {
+            if (!SolvePositionConstraints(data, oStart, oEnd, positionConstraints, positions, angles))
+                unsolved++;
+        }
+
+        return unsolved == 0;
     }
 
     /// <summary>
