@@ -86,17 +86,26 @@ internal sealed partial class ParallelManager : IParallelManagerInternal
     // This lets us avoid re-allocating the ManualResetEventSlims constantly when we just need a way to signal job completion
     // and Parallel.For is really not built for running parallel tasks every tick.
 
-    private readonly ObjectPool<InternalJob> _jobPool =
-        new DefaultObjectPool<InternalJob>(new DefaultPooledObjectPolicy<InternalJob>(), 1024);
+    // Default pool caps used until UpdateCVar runs and resizes them relative to ParallelProcessCount.
+    // A flat constant here would either waste memory on low-core machines or get exhausted (silently
+    // falling back to heap allocation) on high-core machines under heavy contact-tick load.
+    private const int DefaultPoolSize = 1024;
 
-    private readonly ObjectPool<InternalParallelRangeJob> _parallelPool =
-        new DefaultObjectPool<InternalParallelRangeJob>(new DefaultPooledObjectPolicy<InternalParallelRangeJob>(), 1024);
+    // Multiplier applied to ParallelProcessCount to size the pools. Batches routinely queue several
+    // outstanding jobs per worker thread, so a flat per-core count isn't enough headroom.
+    private const int PoolSizePerCore = 128;
+
+    private ObjectPool<InternalJob> _jobPool =
+        new DefaultObjectPool<InternalJob>(new DefaultPooledObjectPolicy<InternalJob>(), DefaultPoolSize);
+
+    private ObjectPool<InternalParallelRangeJob> _parallelPool =
+        new DefaultObjectPool<InternalParallelRangeJob>(new DefaultPooledObjectPolicy<InternalParallelRangeJob>(), DefaultPoolSize);
 
     /// <summary>
     /// Used internally for Parallel jobs, for external callers it gets garbage collected.
     /// </summary>
-    private readonly ObjectPool<ParallelTracker> _trackerPool =
-        new DefaultObjectPool<ParallelTracker>(new DefaultPooledObjectPolicy<ParallelTracker>(), 1024);
+    private ObjectPool<ParallelTracker> _trackerPool =
+        new DefaultObjectPool<ParallelTracker>(new DefaultPooledObjectPolicy<ParallelTracker>(), DefaultPoolSize);
 
     public void Initialize()
     {
@@ -137,6 +146,14 @@ internal sealed partial class ParallelManager : IParallelManagerInternal
 
         if (oldCount != ParallelProcessCount)
         {
+            // Scale the job pools relative to the new worker count so heavy contact ticks don't
+            // exhaust the cap and silently fall back to heap allocation. Floor at DefaultPoolSize
+            // to avoid shrinking below the previous flat constant on low-core machines.
+            var poolSize = Math.Max(DefaultPoolSize, ParallelProcessCount * PoolSizePerCore);
+            _jobPool = new DefaultObjectPool<InternalJob>(new DefaultPooledObjectPolicy<InternalJob>(), poolSize);
+            _parallelPool = new DefaultObjectPool<InternalParallelRangeJob>(new DefaultPooledObjectPolicy<InternalParallelRangeJob>(), poolSize);
+            _trackerPool = new DefaultObjectPool<ParallelTracker>(new DefaultPooledObjectPolicy<ParallelTracker>(), poolSize);
+
             ParallelCountChanged?.Invoke();
             ThreadPool.SetMaxThreads(ParallelProcessCount, oldCompletion);
         }
@@ -177,6 +194,17 @@ internal sealed partial class ParallelManager : IParallelManagerInternal
 
     public void ProcessNow(IParallelRangeRobustJob job, int amount)
     {
+        // Hyperion: honor a single-threaded configuration (thread.parallel_count = 1) as GENUINELY serial.
+        // Otherwise ProcessNow fans batches onto the CLR thread pool regardless of ParallelProcessCount, so
+        // "single-threaded" physics (e.g. the determinism gate, and clients that pin parallelism off) still
+        // raced across leftover pool workers. Running inline here makes ParallelProcessCount <= 1 truly serial
+        // and deterministic, with no behavior change at the normal multi-core setting.
+        if (ParallelProcessCount <= 1)
+        {
+            ProcessSerialNow(job, amount);
+            return;
+        }
+
         var batches = amount / (float) job.BatchSize;
 
         // Below the threshold so just do it now.

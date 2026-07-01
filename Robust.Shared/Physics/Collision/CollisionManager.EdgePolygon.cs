@@ -41,9 +41,10 @@ internal sealed partial class CollisionManager
 
         // Get polygonB in frameA
         var tempPolyCount = polygonB.VertexCount;
-        // Can't use Spans because these may get attached to the manifold.
-        var tempPolyVerts = new Vector2[tempPolyCount];
-        var tempPolyNorms = new Vector2[tempPolyCount];
+        // Values are copied out by-value everywhere below (Vector2 is a struct); nothing stores
+        // these array/span references, so stackalloc is safe and avoids a per-call heap allocation.
+        Span<Vector2> tempPolyVerts = stackalloc Vector2[tempPolyCount];
+        Span<Vector2> tempPolyNorms = stackalloc Vector2[tempPolyCount];
 
         for (var i = 0; i < tempPolyCount; ++i)
 	    {
